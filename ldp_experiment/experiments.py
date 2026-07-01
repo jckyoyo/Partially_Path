@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
+import random
+import sys
 from typing import Any, Optional
 
 import networkx as nx
 
-from .candidate_cycles import enumerate_candidate_cycles
-from .conflict_dp import solve_by_conflict_dp
-from .graph_utils import EPS, add_edge_with_attrs
-from .ldp_algorithm import run_ldp
-from .residual_ilp import solve_candidate_edge_subgraph_ilp, solve_residual_circulation_ilp
+if __package__ in {None, ""}:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ldp_experiment.candidate_cycles import enumerate_candidate_cycles
+from ldp_experiment.conflict_dp import solve_by_conflict_dp
+from ldp_experiment.graph_utils import EPS, add_edge_with_attrs
+from ldp_experiment.ldp_algorithm import run_ldp
+from ldp_experiment.residual_ilp import solve_candidate_edge_subgraph_ilp, solve_residual_circulation_ilp
 
 
 def generate_random_digraph(
@@ -23,17 +29,17 @@ def generate_random_digraph(
     seed: Optional[int] = None,
 ) -> nx.MultiDiGraph:
     """Generate a directed MultiDiGraph with positive integer weights and eids."""
-    rng = nx.utils.create_random_state(seed)
+    rng = random.Random(seed)
     G = nx.MultiDiGraph()
     G.add_nodes_from(range(n))
     attempts = 0
     while G.number_of_edges() < m and attempts < max(10 * m, 100):
         attempts += 1
-        u = int(rng.randint(0, n))
-        v = int(rng.randint(0, n))
+        u = rng.randrange(n)
+        v = rng.randrange(n)
         if u == v:
             continue
-        add_edge_with_attrs(G, u, v, weight=int(rng.randint(weight_low, weight_high + 1)), cost=0, desc="random")
+        add_edge_with_attrs(G, u, v, weight=rng.randint(weight_low, weight_high), cost=0, desc="random")
     return G
 
 
