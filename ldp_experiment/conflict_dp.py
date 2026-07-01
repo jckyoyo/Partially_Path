@@ -135,6 +135,52 @@ def _component_frontier(cycles: list[Cycle], indices: list[int], conflicts: dict
     return _pareto_states(states)
 
 
+def _large_component_frontier(cycles: list[Cycle], indices: list[int], conflicts: dict[int, set[int]]) -> list[BlockState]:
+    """Build a small heuristic frontier for a conflict block too large to enumerate.
+
+    Exact independent-set enumeration is exponential in the block size. For
+    large blocks this function keeps the experiment alive by producing a
+    conservative set of feasible choices: empty set, good single cycles, and a
+    few greedy independent sets under different orderings. The result is not an
+    exact block frontier; use smaller instances or raise max_exact_component_size
+    when exactness is required.
+    """
+    states: list[BlockState] = [BlockState(0, 0.0, ())]
+
+    def greedy(order: list[int]) -> BlockState:
+        chosen: list[int] = []
+        blocked: set[int] = set()
+        cost = 0
+        weight = 0.0
+        for idx in order:
+            if idx in blocked:
+                continue
+            chosen.append(idx)
+            cost += cycles[idx].cost
+            weight += cycles[idx].weight
+            blocked.add(idx)
+            blocked.update(conflicts[idx])
+        return BlockState(cost, weight, tuple(chosen))
+
+    useful = [i for i in indices if cycles[i].weight < 0 or cycles[i].cost < 0]
+    singletons = sorted(
+        useful,
+        key=lambda i: (cycles[i].weight, cycles[i].cost, len(conflicts[i])),
+    )[:200]
+    states.extend(BlockState(cycles[i].cost, cycles[i].weight, (i,)) for i in singletons)
+
+    orders = [
+        sorted(useful, key=lambda i: cycles[i].weight),
+        sorted(useful, key=lambda i: cycles[i].weight / max(1, abs(cycles[i].cost))),
+        sorted(useful, key=lambda i: (len(conflicts[i]), cycles[i].weight)),
+        sorted(useful, key=lambda i: (cycles[i].cost, cycles[i].weight)),
+    ]
+    for order in orders:
+        if order:
+            states.append(greedy(order))
+    return _pareto_states(states)
+
+
 def solve_by_conflict_dp(cycles: list[Cycle], B: int, max_exact_component_size: int = 25) -> DPResult:
     """Solve candidate-cycle selection under shared-edge conflicts."""
     start = time.perf_counter()
@@ -153,7 +199,9 @@ def solve_by_conflict_dp(cycles: list[Cycle], B: int, max_exact_component_size: 
     for comp in components:
         if len(comp) > max_exact_component_size:
             warnings.warn(f"large conflict component size {len(comp)}; exact backtracking may be slow", RuntimeWarning)
-        frontiers.append(_component_frontier(cycles, comp, conflicts))
+            frontiers.append(_large_component_frontier(cycles, comp, conflicts))
+        else:
+            frontiers.append(_component_frontier(cycles, comp, conflicts))
     meta = (len(components), max((len(c) for c in components), default=0), len(cycles))
     return _solve_frontiers(frontiers, cycles, B, meta, start)
 

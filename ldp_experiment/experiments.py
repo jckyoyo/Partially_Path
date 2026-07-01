@@ -50,6 +50,8 @@ def run_single_experiment(
     k: int,
     delta: int,
     exact_cycle_enum: bool = True,
+    max_cycles_per_anchor: Optional[int] = None,
+    max_exact_component_size: int = 25,
     gurobi_time_limit: Optional[float] = None,
 ) -> dict[str, Any]:
     """Run LDP, candidate-cycle DP, full residual ILP, and candidate-edge ILP."""
@@ -66,8 +68,12 @@ def run_single_experiment(
     if not ldp.feasible:
         row.update({"message": ldp.message})
         return row
-    cycles = enumerate_candidate_cycles(ldp.residual, exact=exact_cycle_enum)
-    dp = solve_by_conflict_dp(cycles, ldp.remaining_budget)
+    cycles = enumerate_candidate_cycles(
+        ldp.residual,
+        exact=exact_cycle_enum,
+        max_cycles_per_anchor=max_cycles_per_anchor,
+    )
+    dp = solve_by_conflict_dp(cycles, ldp.remaining_budget, max_exact_component_size=max_exact_component_size)
     full = solve_residual_circulation_ilp(ldp.residual, ldp.remaining_budget, time_limit=gurobi_time_limit)
     cand = solve_candidate_edge_subgraph_ilp(ldp.residual, cycles, ldp.remaining_budget, time_limit=gurobi_time_limit)
     row.update(
@@ -120,12 +126,25 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, required=True)
     parser.add_argument("--gurobi-time-limit", type=float, default=None)
+    parser.add_argument("--heuristic-cycle-enum", action="store_true")
+    parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
+    parser.add_argument("--max-exact-component-size", type=int, default=25)
     args = parser.parse_args()
     rows = []
     for trial in range(args.trials):
         G = generate_random_digraph(args.n, args.m, seed=args.seed + trial)
         s, t = 0, args.n - 1
-        row = run_single_experiment(G, s, t, args.k, args.delta, gurobi_time_limit=args.gurobi_time_limit)
+        row = run_single_experiment(
+            G,
+            s,
+            t,
+            args.k,
+            args.delta,
+            exact_cycle_enum=not args.heuristic_cycle_enum,
+            max_cycles_per_anchor=args.max_cycles_per_anchor,
+            max_exact_component_size=args.max_exact_component_size,
+            gurobi_time_limit=args.gurobi_time_limit,
+        )
         row.update({"trial": trial, "n": args.n, "m": args.m, "k": args.k, "delta": args.delta})
         rows.append(row)
     with open(args.out, "w", newline="", encoding="utf-8") as f:
