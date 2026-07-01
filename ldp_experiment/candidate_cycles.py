@@ -34,10 +34,18 @@ def enumerate_candidate_cycles(
     """Enumerate useful simple directed cycles using reverse edges as anchors.
 
     Every useful candidate must contain a reverse edge, so anchors are reverse
-    edges. DFS expansion still traverses all directed residual edges because the
-    rest of the cycle may use forward, reverse, and split edges.
+    edges. For a reverse anchor e=(v -> u), a containing directed cycle exists
+    only if u can reach v; SCC pruning removes anchors and DFS branches that
+    cannot participate in such a cycle. DFS expansion still traverses all
+    directed residual edges because the rest of the cycle may use forward,
+    reverse, and split edges.
     """
     by_id = edge_by_id(R)
+    scc_id: dict[Any, int] = {}
+    for sid, comp in enumerate(nx.strongly_connected_components(R)):
+        for node in comp:
+            scc_id[node] = sid
+
     anchors = [edge for edge in by_id.values() if edge.is_reverse]
     anchors.sort(key=lambda e: e.eid)
     reverse_rank = {edge.eid: i for i, edge in enumerate(anchors)}
@@ -45,6 +53,9 @@ def enumerate_candidate_cycles(
     cycles: list[Cycle] = []
 
     for anchor in anchors:
+        if scc_id.get(anchor.u) != scc_id.get(anchor.v):
+            continue
+        sid = scc_id[anchor.u]
         produced = 0
         start = anchor.v
         target = anchor.u
@@ -55,6 +66,8 @@ def enumerate_candidate_cycles(
                 return
             for edge in outgoing_edges(R, u):
                 if edge.eid == anchor.eid:
+                    continue
+                if scc_id.get(edge.v) != sid:
                     continue
                 if edge.is_reverse and reverse_rank.get(edge.eid, 10**18) < reverse_rank[anchor.eid]:
                     continue

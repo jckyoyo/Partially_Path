@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
+from itertools import combinations
 import time
 import warnings
 
@@ -135,73 +137,30 @@ def _component_frontier(cycles: list[Cycle], indices: list[int], conflicts: dict
     return _pareto_states(states)
 
 
-def _large_component_frontier(cycles: list[Cycle], indices: list[int], conflicts: dict[int, set[int]]) -> list[BlockState]:
-    """Build a small heuristic frontier for a conflict block too large to enumerate.
-
-    Exact independent-set enumeration is exponential in the block size. For
-    large blocks this function keeps the experiment alive by producing a
-    conservative set of feasible choices: empty set, good single cycles, and a
-    few greedy independent sets under different orderings. The result is not an
-    exact block frontier; use smaller instances or raise max_exact_component_size
-    when exactness is required.
-    """
-    states: list[BlockState] = [BlockState(0, 0.0, ())]
-
-    def greedy(order: list[int]) -> BlockState:
-        chosen: list[int] = []
-        blocked: set[int] = set()
-        cost = 0
-        weight = 0.0
-        for idx in order:
-            if idx in blocked:
-                continue
-            chosen.append(idx)
-            cost += cycles[idx].cost
-            weight += cycles[idx].weight
-            blocked.add(idx)
-            blocked.update(conflicts[idx])
-        return BlockState(cost, weight, tuple(chosen))
-
-    useful = [i for i in indices if cycles[i].weight < 0 or cycles[i].cost < 0]
-    singletons = sorted(
-        useful,
-        key=lambda i: (cycles[i].weight, cycles[i].cost, len(conflicts[i])),
-    )[:200]
-    states.extend(BlockState(cycles[i].cost, cycles[i].weight, (i,)) for i in singletons)
-
-    orders = [
-        sorted(useful, key=lambda i: cycles[i].weight),
-        sorted(useful, key=lambda i: cycles[i].weight / max(1, abs(cycles[i].cost))),
-        sorted(useful, key=lambda i: (len(conflicts[i]), cycles[i].weight)),
-        sorted(useful, key=lambda i: (cycles[i].cost, cycles[i].weight)),
-    ]
-    for order in orders:
-        if order:
-            states.append(greedy(order))
-    return _pareto_states(states)
-
-
 def solve_by_conflict_dp(cycles: list[Cycle], B: int, max_exact_component_size: int = 25) -> DPResult:
     """Solve candidate-cycle selection under shared-edge conflicts."""
     start = time.perf_counter()
     C = nx.Graph()
     C.add_nodes_from(range(len(cycles)))
-    edge_sets = [set(c.edge_ids) for c in cycles]
     conflicts: dict[int, set[int]] = {i: set() for i in range(len(cycles))}
-    for i in range(len(cycles)):
-        for j in range(i + 1, len(cycles)):
-            if edge_sets[i] & edge_sets[j]:
-                C.add_edge(i, j)
-                conflicts[i].add(j)
-                conflicts[j].add(i)
+    edge_to_cycles: dict[int, list[int]] = defaultdict(list)
+    for i, cycle in enumerate(cycles):
+        for eid in cycle.edge_ids:
+            edge_to_cycles[eid].append(i)
+    for ids in edge_to_cycles.values():
+        for i, j in combinations(ids, 2):
+            C.add_edge(i, j)
+            conflicts[i].add(j)
+            conflicts[j].add(i)
     components = [sorted(comp) for comp in nx.connected_components(C)]
     frontiers: list[list[BlockState]] = []
     for comp in components:
         if len(comp) > max_exact_component_size:
-            warnings.warn(f"large conflict component size {len(comp)}; exact backtracking may be slow", RuntimeWarning)
-            frontiers.append(_large_component_frontier(cycles, comp, conflicts))
-        else:
-            frontiers.append(_component_frontier(cycles, comp, conflicts))
+            warnings.warn(
+                f"large conflict component size {len(comp)}; exact independent-set enumeration may be infeasible",
+                RuntimeWarning,
+            )
+        frontiers.append(_component_frontier(cycles, comp, conflicts))
     meta = (len(components), max((len(c) for c in components), default=0), len(cycles))
     return _solve_frontiers(frontiers, cycles, B, meta, start)
 

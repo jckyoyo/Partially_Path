@@ -52,7 +52,24 @@ def _solve_edge_subset_ilp(
         model.addConstr(out_expr - in_expr == 0, name=f"flow_{v}")
     model.optimize()
     status = model.Status
-    status_name = {getattr(GRB, name): name for name in dir(GRB) if name.isupper() and isinstance(getattr(GRB, name), int)}.get(status, str(status))
+    status_name = {
+        GRB.OPTIMAL: "OPTIMAL",
+        GRB.TIME_LIMIT: "TIME_LIMIT",
+        GRB.INFEASIBLE: "INFEASIBLE",
+        GRB.INF_OR_UNBD: "INF_OR_UNBD",
+        GRB.UNBOUNDED: "UNBOUNDED",
+        GRB.CUTOFF: "CUTOFF",
+        GRB.ITERATION_LIMIT: "ITERATION_LIMIT",
+        GRB.NODE_LIMIT: "NODE_LIMIT",
+        GRB.SOLUTION_LIMIT: "SOLUTION_LIMIT",
+        GRB.INTERRUPTED: "INTERRUPTED",
+        GRB.NUMERIC: "NUMERIC",
+        GRB.SUBOPTIMAL: "SUBOPTIMAL",
+        GRB.INPROGRESS: "INPROGRESS",
+        GRB.USER_OBJ_LIMIT: "USER_OBJ_LIMIT",
+        GRB.WORK_LIMIT: "WORK_LIMIT",
+        GRB.MEM_LIMIT: "MEM_LIMIT",
+    }.get(status, str(status))
     if model.SolCount == 0:
         return ILPResult(0.0, 0, [], False, status_name, time.perf_counter() - start)
     selected = [eid for eid, var in x.items() if var.X > 0.5]
