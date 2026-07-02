@@ -75,13 +75,16 @@ def generate_random_digraph(
     weight_low: int = 1,
     weight_high: int = 100,
     seed: Optional[int] = None,
+    allow_parallel: bool = True,
 ) -> nx.MultiDiGraph:
     """Generate a random directed MultiDiGraph with positive integer weights.
 
     Notes
     -----
-    * Parallel edges are allowed, which is consistent with MultiDiGraph and
-      avoids impossible requests when ``m > n * (n - 1)``.
+    * Parallel edges are allowed by default, which is consistent with
+      MultiDiGraph and avoids impossible requests when ``m > n * (n - 1)``.
+      Set ``allow_parallel=False`` to generate a simple directed edge set
+      stored in a MultiDiGraph.
     * Edge IDs are assigned incrementally during generation. This avoids the
       expensive pattern of scanning all existing edges to find the next eid.
     * All generated edges start as original forward edges with cost 0.
@@ -92,17 +95,24 @@ def generate_random_digraph(
         raise ValueError("m must be non-negative")
     if weight_low <= 0 or weight_high < weight_low:
         raise ValueError("weights must be positive and weight_high >= weight_low")
+    if not allow_parallel and m > n * (n - 1):
+        raise ValueError("m cannot exceed n * (n - 1) when parallel edges are disabled")
 
     rng = random.Random(seed)
     G = nx.MultiDiGraph()
     G.add_nodes_from(range(n))
+    used_pairs: set[tuple[int, int]] = set()
 
     for eid in range(m):
         while True:
             u = rng.randrange(n)
             v = rng.randrange(n)
-            if u != v:
-                break
+            if u == v:
+                continue
+            if not allow_parallel and (u, v) in used_pairs:
+                continue
+            used_pairs.add((u, v))
+            break
         add_edge_with_attrs(
             G,
             u,
@@ -304,6 +314,7 @@ CSV_FIELDS = [
     "m",
     "k",
     "delta",
+    "allow_parallel",
     "s",
     "t",
     "cycle_enum_exact",
@@ -361,6 +372,7 @@ def main() -> None:
     parser.add_argument("--target", type=int, default=None)
     parser.add_argument("--weight-low", type=int, default=1)
     parser.add_argument("--weight-high", type=int, default=100)
+    parser.add_argument("--no-parallel-edges", action="store_true", help="Generate no duplicate directed (u, v) edges.")
     parser.add_argument("--gurobi-time-limit", type=float, default=None)
     parser.add_argument("--mip-gap", type=float, default=None)
     parser.add_argument("--skip-ilp", action="store_true", help="Skip both full and candidate-edge ILP baselines.")
@@ -387,6 +399,7 @@ def main() -> None:
             weight_low=args.weight_low,
             weight_high=args.weight_high,
             seed=trial_seed,
+            allow_parallel=not args.no_parallel_edges,
         )
         row = run_single_experiment(
             G,
@@ -410,6 +423,7 @@ def main() -> None:
                 "m": args.m,
                 "k": args.k,
                 "delta": args.delta,
+                "allow_parallel": not args.no_parallel_edges,
             }
         )
         rows.append(row)
