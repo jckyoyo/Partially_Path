@@ -26,6 +26,14 @@ def _cycle_kind(weight: float, cost: int) -> Optional[str]:
     return None
 
 
+def _has_positive_in_edge(R: nx.MultiDiGraph, node: Any) -> bool:
+    """Return whether any residual edge with positive weight enters ``node``."""
+    for _u, _v, _key, data in R.in_edges(node, keys=True, data=True):
+        if float(data.get("weight", 0.0)) > EPS:
+            return True
+    return False
+
+
 def enumerate_candidate_cycles(
     R: nx.MultiDiGraph,
     exact: bool = True,
@@ -46,7 +54,15 @@ def enumerate_candidate_cycles(
         for node in comp:
             scc_id[node] = sid
 
-    anchors = [edge for edge in by_id.values() if edge.is_reverse]
+    # A useful reverse anchor is the reversal of a used edge u->v, now v->u.
+    # The local improvement structure needs a positive-weight edge entering v
+    # (the current reverse edge tail); otherwise this reverse edge cannot serve
+    # as the intended alternating anchor and is skipped before DFS.
+    anchors = [
+        edge
+        for edge in by_id.values()
+        if edge.is_reverse and _has_positive_in_edge(R, edge.u)
+    ]
     anchors.sort(key=lambda e: e.eid)
     reverse_rank = {edge.eid: i for i, edge in enumerate(anchors)}
     seen: set[frozenset[int]] = set()
