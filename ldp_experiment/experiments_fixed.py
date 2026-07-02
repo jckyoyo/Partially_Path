@@ -174,6 +174,7 @@ def run_single_experiment(
     mip_gap: Optional[float] = None,
     run_ilp: bool = True,
     validate_cycles: bool = True,
+    print_progress: bool = False,
 ) -> dict[str, Any]:
     """Run one full experiment on a supplied NetworkX MultiDiGraph.
 
@@ -193,10 +194,14 @@ def run_single_experiment(
     )
 
     # 1. LDP / residual graph construction.
+    if print_progress:
+        print("  [1/4] LDP start", flush=True)
     try:
         ldp = run_ldp(G, s, t, k, delta)
     except Exception as exc:
         row.update({"ldp_feasible": False, "ldp_message": _safe_error_message(exc)})
+        if print_progress:
+            print(f"  [1/4] LDP failed: {row['ldp_message']}", flush=True)
         return row
 
     row.update(
@@ -212,11 +217,24 @@ def run_single_experiment(
         }
     )
     if not ldp.feasible:
+        if print_progress:
+            print(f"  [1/4] LDP infeasible: {ldp.message}", flush=True)
         return row
+    if print_progress:
+        print(
+            "  [1/4] LDP done: "
+            f"base_weight={ldp.base_weight}, used_cost={ldp.used_cost}, "
+            f"B={ldp.remaining_budget}, residual=({ldp.residual.number_of_nodes()} nodes, "
+            f"{ldp.residual.number_of_edges()} edges)",
+            flush=True,
+        )
 
     B = ldp.remaining_budget
 
     # 2. Candidate-cycle enumeration.
+    if print_progress:
+        enum_mode = "exact" if exact_cycle_enum else f"limited({max_cycles_per_anchor}/anchor)"
+        print(f"  [2/4] candidate cycle enumeration start: {enum_mode}", flush=True)
     try:
         cycles = enumerate_candidate_cycles(
             ldp.residual,
@@ -227,6 +245,8 @@ def run_single_experiment(
             validate_candidate_cycles(ldp.residual, cycles)
     except Exception as exc:
         row.update({"cycle_enum_error": _safe_error_message(exc)})
+        if print_progress:
+            print(f"  [2/4] candidate cycle enumeration failed: {row['cycle_enum_error']}", flush=True)
         return row
 
     num_neg_pos, num_nonneg_neg = _count_cycle_kinds(cycles)
@@ -237,8 +257,17 @@ def run_single_experiment(
             "num_nonneg_weight_neg_cost": num_nonneg_neg,
         }
     )
+    if print_progress:
+        print(
+            "  [2/4] candidate cycle enumeration done: "
+            f"total={len(cycles)}, neg_weight_pos_cost={num_neg_pos}, "
+            f"nonneg_weight_neg_cost={num_nonneg_neg}",
+            flush=True,
+        )
 
     # 3. Conflict-DP.
+    if print_progress:
+        print(f"  [3/4] conflict DP start: max_exact_component_size={max_exact_component_size}", flush=True)
     try:
         dp = solve_by_conflict_dp(cycles, B, max_exact_component_size=max_exact_component_size)
         dp_validation_error = _validate_dp_result(dp)
@@ -257,9 +286,21 @@ def run_single_experiment(
         )
     except Exception as exc:
         row.update({"dp_error": _safe_error_message(exc)})
+        if print_progress:
+            print(f"  [3/4] conflict DP failed: {row['dp_error']}", flush=True)
         return row
+    if print_progress:
+        print(
+            "  [3/4] conflict DP done: "
+            f"objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, "
+            f"components={dp.num_components}, max_component={dp.max_component_size}, "
+            f"states={dp.num_dp_states}, time={dp.runtime_sec:.6f}s",
+            flush=True,
+        )
 
     # 4. Optional ILP baselines.
+    if print_progress:
+        print("  [4/4] ILP baselines start" if run_ilp else "  [4/4] ILP baselines skipped", flush=True)
     if run_ilp:
         try:
             full = solve_residual_circulation_ilp(
@@ -304,6 +345,13 @@ def run_single_experiment(
             "cand_ilp_matches_full_ilp": _match_if_certified(cand.objective, full.objective, cand.status, full.status),
         }
     )
+    if print_progress:
+        print(
+            "  [4/4] ILP baselines done: "
+            f"full=({full.status}, obj={full.objective}, time={full.runtime_sec:.6f}s), "
+            f"cand=({cand.status}, obj={cand.objective}, time={cand.runtime_sec:.6f}s)",
+            flush=True,
+        )
     return row
 
 
@@ -414,6 +462,7 @@ def main() -> None:
             mip_gap=args.mip_gap,
             run_ilp=not args.skip_ilp,
             validate_cycles=not args.no_validate_cycles,
+            print_progress=args.print_progress,
         )
         row.update(
             {
