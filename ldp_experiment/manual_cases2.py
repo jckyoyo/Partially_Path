@@ -111,7 +111,7 @@ def main() -> None:
     dp = solve_by_conflict_dp(cycles, ldp.remaining_budget)
     dp_wall_time = time.perf_counter() - dp_start
     our_algorithm_time = enum_time + dp_wall_time
-    print(f"DP objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, selected={len(dp.selected_cycles)}")
+
     print(f"DP runtime={dp.runtime_sec:.6f}s, wall={dp_wall_time:.6f}s")
     print(f"our postprocess total runtime={our_algorithm_time:.6f}s")
 
@@ -121,15 +121,24 @@ def main() -> None:
     cand_start = time.perf_counter()
     cand = solve_candidate_edge_subgraph_ilp(ldp.residual, cycles, ldp.remaining_budget, time_limit=args.gurobi_time_limit)
     cand_wall_time = time.perf_counter() - cand_start
-    print(f"full ILP objective={full.objective}, cost={full.total_cost}, improved={full.improved}, status={full.status}")
-    print(f"full ILP runtime={full.runtime_sec:.6f}s, wall={full_wall_time:.6f}s")
-    print(f"cand ILP objective={cand.objective}, cost={cand.total_cost}, improved={cand.improved}, status={cand.status}")
-    print(f"cand ILP runtime={cand.runtime_sec:.6f}s, wall={cand_wall_time:.6f}s")
-    print(f"LDP + our postprocess runtime={ldp_time + our_algorithm_time:.6f}s")
-    print(f"LDP + full ILP runtime={ldp_time + full_wall_time:.6f}s")
-    print(f"LDP + cand ILP runtime={ldp_time + cand_wall_time:.6f}s")
+
+    print("-----------------测试总运行时间--------------------")
     print(f"total runtime={time.perf_counter() - total_start:.6f}s")
 
+    print("-----------------ldp运行时间--------------------")
+    print(f"LDP runtime={ldp_time:.6f}s")
+    print("-----------------our algorithm--------------------")
+    print(f"our postprocess total runtime={our_algorithm_time:.6f}s")
+    print(f"LDP + our postprocess runtime={ldp_time + our_algorithm_time:.6f}s")
+    print("-----------------ILP algorithm--------------------")
+    print(f"full ILP runtime={full.runtime_sec:.6f}s, wall={full_wall_time:.6f}s")
+    print(f"cand ILP runtime={cand.runtime_sec:.6f}s, wall={cand_wall_time:.6f}s")
+    print(f"LDP + full ILP runtime={ldp_time + full_wall_time:.6f}s")
+    print(f"LDP + cand ILP runtime={ldp_time + cand_wall_time:.6f}s")
 
+    print("-----------------输出值对比--------------------")
+    print(f"DP objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, selected={len(dp.selected_cycles)}")
+    print(f"full ILP objective={full.objective}, cost={full.total_cost}, improved={full.improved}, status={full.status}")
+    print(f"cand ILP objective={cand.objective}, cost={cand.total_cost}, improved={cand.improved}, status={cand.status}")
 if __name__ == "__main__":
     main()
