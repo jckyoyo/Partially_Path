@@ -7,8 +7,18 @@ below is an interface convenience only and does not change generation logic.
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
+import time
 from typing import Any
+
+import networkx as nx
+
+from ldp_experiment.candidate_cycles import enumerate_candidate_cycles, validate_candidate_cycles
+from ldp_experiment.conflict_dp import solve_by_conflict_dp
+from ldp_experiment.graph_utils import add_edge_with_attrs, edge_by_id
+from ldp_experiment.ldp_algorithm import run_ldp
+from ldp_experiment.residual_ilp import solve_candidate_edge_subgraph_ilp, solve_residual_circulation_ilp
 
 
 WeightedEdge = tuple[str, str, int]
@@ -343,3 +353,216 @@ def generate_counterexample_instance(
         M=M,
     )
     return CounterexampleInstance(edges=edges, k=k_out, delta=delta, info=info)
+
+
+def build_counterexample_graph(edges: list[WeightedEdge]) -> nx.MultiDiGraph:
+    """Convert weighted edge tuples into the project's MultiDiGraph format."""
+    G = nx.MultiDiGraph()
+    for u, v, weight in edges:
+        add_edge_with_attrs(G, u, v, weight=weight, cost=0, desc="contradiction")
+    return G
+
+
+def describe_cycle(edge_map, edge_ids: tuple[int, ...]) -> str:
+    """Return a compact edge-by-edge cycle description for debugging."""
+    parts = []
+    for eid in edge_ids:
+        edge = edge_map[eid]
+        marker = "R" if edge.is_reverse else "F"
+        parts.append(f"{eid}:{edge.u}->{edge.v}:w={edge.weight}:c={edge.cost}:{marker}")
+    return " | ".join(parts)
+
+
+def run_counterexample_experiment(
+    *,
+    k: int,
+    slots_per_pair: int = 3,
+    release_alts: int = 2,
+    use_alts: int = 2,
+    alpha: int = 2,
+    M: int = 40,
+    max_cycles_per_anchor: int | None = None,
+    gurobi_time_limit: float | None = 5.0,
+    run_ilp: bool = True,
+) -> dict[str, Any]:
+    """Generate a counterexample and run the current LDP/postprocess pipeline."""
+    total_start = time.perf_counter()
+    instance = generate_counterexample_instance(
+        k=k,
+        slots_per_pair=slots_per_pair,
+        release_alts=release_alts,
+        use_alts=use_alts,
+        alpha=alpha,
+        M=M,
+    )
+    G = build_counterexample_graph(instance.edges)
+
+    ldp_start = time.perf_counter()
+    ldp = run_ldp(G, "s", "t", instance.k, instance.delta)
+    ldp_time = time.perf_counter() - ldp_start
+
+    result: dict[str, Any] = {
+        "instance": instance,
+        "graph": G,
+        "ldp": ldp,
+        "ldp_time": ldp_time,
+        "total_runtime": None,
+    }
+    if not ldp.feasible:
+        result["total_runtime"] = time.perf_counter() - total_start
+        return result
+
+    enum_start = time.perf_counter()
+    cycles = enumerate_candidate_cycles(
+        ldp.residual,
+        exact=max_cycles_per_anchor is None,
+        max_cycles_per_anchor=max_cycles_per_anchor,
+    )
+    enum_time = time.perf_counter() - enum_start
+
+    validate_start = time.perf_counter()
+    validate_candidate_cycles(ldp.residual, cycles)
+    validate_time = time.perf_counter() - validate_start
+
+    dp_start = time.perf_counter()
+    dp = solve_by_conflict_dp(cycles, ldp.remaining_budget)
+    dp_wall = time.perf_counter() - dp_start
+
+    full = None
+    cand = None
+    full_wall = 0.0
+    cand_wall = 0.0
+    if run_ilp:
+        full_start = time.perf_counter()
+        full = solve_residual_circulation_ilp(ldp.residual, ldp.remaining_budget, time_limit=gurobi_time_limit)
+        full_wall = time.perf_counter() - full_start
+        cand_start = time.perf_counter()
+        cand = solve_candidate_edge_subgraph_ilp(ldp.residual, cycles, ldp.remaining_budget, time_limit=gurobi_time_limit)
+        cand_wall = time.perf_counter() - cand_start
+
+    result.update(
+        {
+            "cycles": cycles,
+            "dp": dp,
+            "full_ilp": full,
+            "cand_ilp": cand,
+            "enum_time": enum_time,
+            "validate_time": validate_time,
+            "dp_wall": dp_wall,
+            "full_ilp_wall": full_wall,
+            "cand_ilp_wall": cand_wall,
+            "our_postprocess_time": enum_time + validate_time + dp_wall,
+            "total_runtime": time.perf_counter() - total_start,
+        }
+    )
+    return result
+
+
+def _cycle_cost_summary(cycles) -> dict[tuple[str, int], int]:
+    out: dict[tuple[str, int], int] = {}
+    for cycle in cycles:
+        key = (cycle.kind, cycle.cost)
+        out[key] = out.get(key, 0) + 1
+    return dict(sorted(out.items(), key=lambda item: (item[0][0], item[0][1])))
+
+
+def _print_experiment_result(result: dict[str, Any], show_cycles: bool = False, cycle_limit: int = 20) -> None:
+    instance: CounterexampleInstance = result["instance"]
+    G: nx.MultiDiGraph = result["graph"]
+    ldp = result["ldp"]
+    print(f"LDP feasible: {ldp.feasible}, message={ldp.message}")
+    print(
+        f"k={instance.k}, delta={instance.delta}, "
+        f"slots_per_pair={instance.info['slots_per_pair']}, "
+        f"release_alts={instance.info['candidate_release_cycles_at_least'] // max(1, instance.info['total_slots'])}, "
+        f"use_alts={instance.info['candidate_use_cycles_at_least'] // max(1, instance.info['total_slots'])}"
+    )
+    print(f"graph_nodes={G.number_of_nodes()}, graph_edges={G.number_of_edges()}")
+    print(
+        f"theoretical_greedy={instance.info['greedy_pattern_weight']}, "
+        f"theoretical_optimal={instance.info['optimal_pattern_weight']}, "
+        f"expected_improvement={instance.info['expected_improvement']}"
+    )
+    print(f"base_weight={ldp.base_weight}, used_cost={ldp.used_cost}, remaining_budget={ldp.remaining_budget}")
+    print(f"paths(edge ids)={ldp.paths}")
+    print(f"LDP runtime={result['ldp_time']:.6f}s")
+    if not ldp.feasible:
+        print(f"total runtime={result['total_runtime']:.6f}s")
+        return
+
+    cycles = result["cycles"]
+    print(f"num_candidates={len(cycles)}")
+    print(f"candidate cost summary={_cycle_cost_summary(cycles)}")
+    print(f"candidate enumeration runtime={result['enum_time']:.6f}s")
+    print(f"candidate validation runtime={result['validate_time']:.6f}s")
+
+    if show_cycles:
+        edge_map = edge_by_id(ldp.residual)
+        for i, cycle in enumerate(cycles[:cycle_limit]):
+            print(f"cycle[{i}] kind={cycle.kind}, weight={cycle.weight}, cost={cycle.cost}")
+            print(f"  {describe_cycle(edge_map, cycle.edge_ids)}")
+        if len(cycles) > cycle_limit:
+            print(f"... skipped {len(cycles) - cycle_limit} cycles")
+
+    dp = result["dp"]
+    print("-----------------测试总运行时间--------------------")
+    print(f"total runtime={result['total_runtime']:.6f}s")
+
+    print("-----------------ldp运行时间--------------------")
+    print(f"LDP runtime={result['ldp_time']:.6f}s")
+    print("-----------------our algorithm--------------------")
+    print(f"candidate enumeration runtime={result['enum_time']:.6f}s")
+    print(f"candidate validation runtime={result['validate_time']:.6f}s")
+    print(f"DP runtime={dp.runtime_sec:.6f}s, wall={result['dp_wall']:.6f}s")
+    print(f"our postprocess total runtime={result['our_postprocess_time']:.6f}s")
+    print(f"LDP + our postprocess runtime={result['ldp_time'] + result['our_postprocess_time']:.6f}s")
+
+    print("-----------------ILP algorithm--------------------")
+    full = result["full_ilp"]
+    cand = result["cand_ilp"]
+    if full is None or cand is None:
+        print("ILP skipped")
+    else:
+        print(f"full ILP runtime={full.runtime_sec:.6f}s, wall={result['full_ilp_wall']:.6f}s")
+        print(f"cand ILP runtime={cand.runtime_sec:.6f}s, wall={result['cand_ilp_wall']:.6f}s")
+        print(f"LDP + full ILP runtime={result['ldp_time'] + result['full_ilp_wall']:.6f}s")
+        print(f"LDP + cand ILP runtime={result['ldp_time'] + result['cand_ilp_wall']:.6f}s")
+
+    print("-----------------输出值对比--------------------")
+    print(f"DP objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, selected={len(dp.selected_cycles)}")
+    if full is not None and cand is not None:
+        print(f"full ILP objective={full.objective}, cost={full.total_cost}, improved={full.improved}, status={full.status}")
+        print(f"cand ILP objective={cand.objective}, cost={cand.total_cost}, improved={cand.improved}, status={cand.status}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the contradiction counterexample through the LDP framework.")
+    parser.add_argument("--k", type=int, default=3)
+    parser.add_argument("--slots-per-pair", type=int, default=3)
+    parser.add_argument("--release-alts", type=int, default=2)
+    parser.add_argument("--use-alts", type=int, default=2)
+    parser.add_argument("--alpha", type=int, default=2)
+    parser.add_argument("--M", type=int, default=40)
+    parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
+    parser.add_argument("--gurobi-time-limit", type=float, default=5.0)
+    parser.add_argument("--skip-ilp", action="store_true")
+    parser.add_argument("--show-cycles", action="store_true")
+    parser.add_argument("--cycle-limit", type=int, default=20)
+    args = parser.parse_args()
+
+    result = run_counterexample_experiment(
+        k=args.k,
+        slots_per_pair=args.slots_per_pair,
+        release_alts=args.release_alts,
+        use_alts=args.use_alts,
+        alpha=args.alpha,
+        M=args.M,
+        max_cycles_per_anchor=args.max_cycles_per_anchor,
+        gurobi_time_limit=args.gurobi_time_limit,
+        run_ilp=not args.skip_ilp,
+    )
+    _print_experiment_result(result, show_cycles=args.show_cycles, cycle_limit=args.cycle_limit)
+
+
+if __name__ == "__main__":
+    main()
