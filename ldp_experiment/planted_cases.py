@@ -19,6 +19,10 @@ from ldp_experiment.residual_ilp import solve_candidate_edge_subgraph_ilp, solve
 def generate_planted_improvement_graph(
     k: int,
     *,
+    blocks: int = 1,
+    release_variants: int = 1,
+    improve_variants: int = 1,
+    extra_path_length: int = 4,
     high_edge_weight: int = 20,
     detour_left_weight: int = 1,
     detour_right_weight: int = 2,
@@ -34,15 +38,20 @@ def generate_planted_improvement_graph(
     """Generate a graph with planted release-budget and negative-weight cycles.
 
     The construction generalizes ``manual_cases2`` with a stable three-path
-    improvement core. For k>3 it adds disjoint load paths, which increases the
-    number of requested paths without changing the planted improvement. The
-    first core path has a slightly heavier shortcut b0->d0 that can release c1.
-    The last core path has a high edge q->r, while q->e->r is cheaper but would
-    add e as one extra common node with the first path. With delta=2, LDP has no
-    spare budget for q->e->r until the release cycle is applied.
+    improvement core. ``blocks`` multiplies the number of release and improve
+    variants inside that one core, which increases candidate-cycle count, node
+    count, and edge count without letting LDP consume independent blocks before
+    the postprocess phase. Extra disjoint paths increase k.
     """
-    if k < 2:
-        raise ValueError("k must be at least 2")
+    if blocks < 1:
+        raise ValueError("blocks must be at least 1")
+    if release_variants < 1 or improve_variants < 1:
+        raise ValueError("release_variants and improve_variants must be at least 1")
+    if extra_path_length < 1:
+        raise ValueError("extra_path_length must be at least 1")
+    required_paths = 3
+    if k < required_paths:
+        raise ValueError("k must be at least 3")
     if noise_edges < 0 or noise_nodes < 0:
         raise ValueError("noise sizes must be non-negative")
 
@@ -56,36 +65,43 @@ def generate_planted_improvement_graph(
         used_pairs.add((u, v))
         add_edge_with_attrs(G, u, v, weight=weight, cost=0, desc="planted")
 
-    # Path 0 has the release gadget b0->c1->d0 versus b0->d0, and later the
-    # detour node e. The shortcut is deliberately heavier than b0->c1->d0, so
-    # LDP uses c1 first; the residual shortcut can later release one budget unit.
+    total_release_variants = blocks * release_variants
+    total_improve_variants = blocks * improve_variants
+
+    # Path 0 has the release gadget b0->c1->d0 and later the detour target e.
     add("s", "a0", segment_weight)
     add("a0", "b0", segment_weight)
     add("b0", "c1", segment_weight)
     add("c1", "d0", segment_weight)
     add("d0", "e", segment_weight)
     add("e", "t", segment_weight)
-    add("b0", "d0", release_shortcut_weight)
 
-    if k >= 3:
-        # Middle core path, matching the shape s-f-g-h-c-j-k-l-t from
-        # manual_cases2. It shares c1 with path 0 and c2 with the long core path.
-        add("s", "mid_1_0", segment_weight)
-        add("mid_1_0", "c2", segment_weight)
-        add("c2", "mid_1_1", segment_weight)
-        add("mid_1_1", "c1", segment_weight)
-        add("c1", "mid_1_2", segment_weight)
-        add("mid_1_2", "mid_1_3", segment_weight)
-        add("mid_1_3", "mid_1_4", segment_weight)
-        add("mid_1_4", "t", segment_weight)
+    # Release variants generate many nonnegative-weight negative-cost cycles.
+    # They share the same reversed b0-c1 and c1-d0 edges, so they intentionally
+    # form one conflict block.
+    for variant in range(total_release_variants):
+        if variant == 0:
+            add("b0", "d0", release_shortcut_weight)
+        else:
+            rel = f"release_alt_{variant}"
+            add("b0", rel, segment_weight)
+            add(rel, "d0", release_shortcut_weight + variant - segment_weight)
 
-    # Last core path shares c2 with the middle core path when k>=3, or c1 with
-    # path 0 in the two-path mini case. The cheaper q->e->r detour is blocked
-    # during LDP because e is already used by path 0 and the core budget is full.
-    last_common = "c2" if k >= 3 else "c1"
+    # Middle core path. It shares c1 with path 0 and c2 with the long path.
+    add("s", "mid_1_0", segment_weight)
+    add("mid_1_0", "c2", segment_weight)
+    add("c2", "mid_1_1", segment_weight)
+    add("mid_1_1", "c1", segment_weight)
+    add("c1", "mid_1_2", segment_weight)
+    add("mid_1_2", "mid_1_3", segment_weight)
+    add("mid_1_3", "mid_1_4", segment_weight)
+    add("mid_1_4", "t", segment_weight)
+
+    # Long path uses q->r. Cheaper q->...->e->r variants are blocked during LDP
+    # because e is already used by path 0 and the core budget is full.
     add("s", "long_0", segment_weight)
-    add("long_0", last_common, segment_weight)
-    add(last_common, "long_1", segment_weight)
+    add("long_0", "c2", segment_weight)
+    add("c2", "long_1", segment_weight)
     add("long_1", "long_2", segment_weight)
     add("long_2", "long_3", segment_weight)
     add("long_3", "q", segment_weight)
@@ -94,16 +110,24 @@ def generate_planted_improvement_graph(
     add("long_4", "long_5", segment_weight)
     add("long_5", "t", segment_weight)
 
-    add("q", "e", detour_left_weight)
     add("e", "r", detour_right_weight)
+    for variant in range(total_improve_variants):
+        if variant == 0:
+            add("q", "e", detour_left_weight)
+        else:
+            imp = f"improve_alt_{variant}"
+            add("q", imp, segment_weight)
+            add(imp, "e", detour_left_weight + variant)
 
-    # Extra paths are intentionally disjoint from the improvement core. They
+    # Extra paths are intentionally disjoint from the improvement blocks. They
     # let experiments scale k while preserving a predictable planted optimum.
-    for i in range(3, k):
-        add("s", f"extra_{i}_0", segment_weight)
-        add(f"extra_{i}_0", f"extra_{i}_1", segment_weight)
-        add(f"extra_{i}_1", f"extra_{i}_2", segment_weight)
-        add(f"extra_{i}_2", "t", segment_weight)
+    for i in range(required_paths, k):
+        prev = "s"
+        for j in range(extra_path_length - 1):
+            cur = f"extra_{i}_{j}"
+            add(prev, cur, segment_weight)
+            prev = cur
+        add(prev, "t", segment_weight)
 
     # Optional high-weight random noise.
     noise_vertices = [f"noise_{i}" for i in range(noise_nodes)]
@@ -143,6 +167,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a planted residual-improvement instance.")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--delta", type=int, default=None)
+    parser.add_argument("--blocks", type=int, default=1)
+    parser.add_argument("--release-variants", type=int, default=1)
+    parser.add_argument("--improve-variants", type=int, default=1)
+    parser.add_argument("--extra-path-length", type=int, default=4)
     parser.add_argument("--noise-nodes", type=int, default=0)
     parser.add_argument("--noise-edges", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -150,10 +178,14 @@ def main() -> None:
     parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
     args = parser.parse_args()
 
-    delta = (2 if args.k >= 3 else 1) if args.delta is None else args.delta
+    delta = 2 if args.delta is None else args.delta
     total_start = time.perf_counter()
     G = generate_planted_improvement_graph(
         args.k,
+        blocks=args.blocks,
+        release_variants=args.release_variants,
+        improve_variants=args.improve_variants,
+        extra_path_length=args.extra_path_length,
         noise_nodes=args.noise_nodes,
         noise_edges=args.noise_edges,
         seed=args.seed,
@@ -163,7 +195,11 @@ def main() -> None:
     ldp = run_ldp(G, "s", "t", args.k, delta)
     ldp_time = time.perf_counter() - ldp_start
     print(f"LDP feasible: {ldp.feasible}, message={ldp.message}")
-    print(f"k={args.k}, delta={delta}")
+    print(
+        f"k={args.k}, delta={delta}, blocks={args.blocks}, "
+        f"release_variants={args.release_variants}, improve_variants={args.improve_variants}"
+    )
+    print(f"graph_nodes={G.number_of_nodes()}, graph_edges={G.number_of_edges()}")
     print(f"base_weight={ldp.base_weight}, used_cost={ldp.used_cost}, remaining_budget={ldp.remaining_budget}")
     print(f"paths(edge ids)={ldp.paths}")
     print(f"LDP runtime={ldp_time:.6f}s")
