@@ -305,40 +305,6 @@ def _common_node_count(
     return sum(1 for count in counts.values() if count >= 2)
 
 
-def _project_residual_path_nodes(R: nx.MultiDiGraph, path_edges: list[int]) -> Optional[list[Any]]:
-    """Project a residual edge path to original node labels, collapsing split nodes."""
-    if not path_edges:
-        return []
-    by_id = edge_by_id(R)
-    first = by_id[path_edges[0]]
-    projected = [_base_node(first.u)]
-    cur = first.u
-    for eid in path_edges:
-        edge = by_id[eid]
-        if edge.u != cur:
-            return None
-        cur = edge.v
-        node = _base_node(edge.v)
-        if projected[-1] != node:
-            projected.append(node)
-    return projected
-
-
-def _common_count_from_node_paths(paths: list[list[Any]], s: Any, t: Any) -> Optional[int]:
-    counts: dict[Any, int] = defaultdict(int)
-    for path in paths:
-        if not path or path[0] != s or path[-1] != t:
-            return None
-        internal = path[1:-1]
-        if len(internal) != len(set(internal)):
-            return None
-        for node in set(internal):
-            counts[node] += 1
-    if any(count > 2 for count in counts.values()):
-        return None
-    return sum(1 for count in counts.values() if count >= 2)
-
-
 def _flow_weight(base_edges: dict[int, tuple[Any, Any, float]], flow: dict[int, int]) -> float:
     return sum(base_edges[eid][2] * amount for eid, amount in flow.items() if amount > 0)
 
@@ -355,32 +321,33 @@ def run_ldp(G: nx.MultiDiGraph, s: Any, t: Any, k: int, delta: int) -> LDPResult
         for u, v, _key, data in R.edges(keys=True, data=True)
     }
     q = int(delta)
+    flow: dict[int, int] = {}
     paths: list[list[int]] = []
-    node_paths: list[list[Any]] = []
     base_weight = 0.0
     used_cost = 0
     for i in range(k):
         def validator(path_edges: list[int], round_index: int = i) -> bool:
-            projected = _project_residual_path_nodes(R, path_edges)
-            if projected is None:
+            new_flow = _apply_flow_delta(flow, _path_flow_delta(R, path_edges))
+            decomposed = _decompose_original_flow(base_edges, new_flow, s, t, round_index + 1)
+            if decomposed is None:
                 return False
-            common_count = _common_count_from_node_paths(node_paths + [projected], s, t)
+            common_count = _common_node_count(base_edges, decomposed, s, t)
             return common_count is not None and common_count <= delta
 
         found = bounded_cost_shortest_path(R, s, t, q, path_validator=validator)
         if found is None:
             return LDPResult(False, paths, R, base_weight, used_cost, q, "no bounded-cost augmenting path")
         edge_ids, weight, cost = found
-        projected = _project_residual_path_nodes(R, edge_ids)
-        if projected is None:
-            return LDPResult(False, paths, R, base_weight, used_cost, q, "residual path is not directed")
-        new_common_count = _common_count_from_node_paths(node_paths + [projected], s, t)
-        if new_common_count is None or new_common_count > delta:
-            return LDPResult(False, paths, R, base_weight, used_cost, q, "path set violates common-node budget")
-        paths.append(edge_ids)
-        node_paths.append(projected)
-        used_cost = new_common_count
+        flow = _apply_flow_delta(flow, _path_flow_delta(R, edge_ids))
+        decomposed_paths = _decompose_original_flow(base_edges, flow, s, t, i + 1)
+        if decomposed_paths is None:
+            return LDPResult(False, paths, R, base_weight, used_cost, q, "residual flow cannot be decomposed")
+        common_count = _common_node_count(base_edges, decomposed_paths, s, t)
+        if common_count is None or common_count > delta:
+            return LDPResult(False, paths, R, base_weight, used_cost, q, "decomposed flow violates common-node budget")
+        paths = decomposed_paths
+        used_cost = common_count
         q = delta - used_cost
-        base_weight += weight
+        base_weight = _flow_weight(base_edges, flow)
         update_restricted_residual(R, edge_ids, s, t)
     return LDPResult(True, paths, R, base_weight, used_cost, q, "ok")
