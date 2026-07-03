@@ -29,9 +29,11 @@ _impl = _load_impl()
 BNBNode = _impl.BNBNode
 BNBResult = _impl.BNBResult
 solve_candidate_edge_lagrangian_bnb = _impl.solve_candidate_edge_lagrangian_bnb
+solve_candidate_edge_manual_lagrangian_bnb = _impl.solve_candidate_edge_manual_lagrangian_bnb
 
 __all__ = [
     "BNBNode",
     "BNBResult",
     "solve_candidate_edge_lagrangian_bnb",
+    "solve_candidate_edge_manual_lagrangian_bnb",
 ]

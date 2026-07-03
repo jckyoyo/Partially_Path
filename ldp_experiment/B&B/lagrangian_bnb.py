@@ -529,3 +529,28 @@ def solve_candidate_edge_lagrangian_bnb(
         )
 
     raise ValueError(f"unknown solve_mode {solve_mode!r}")
+
+
+def solve_candidate_edge_manual_lagrangian_bnb(
+    R: nx.MultiDiGraph,
+    B: int,
+    candidate_eids: Optional[set[int]] = None,
+    max_nodes: Optional[int] = None,
+    max_lagrangian_iters: int = 5,
+    time_limit: Optional[float] = None,
+    exact_tail_time_limit: Optional[float] = None,
+    step_rule: str = "polyak",
+    enable_dynamic_scc_pruning: bool = True,
+) -> BNBResult:
+    """Public entry point for the hand-written Lagrangian B&B variant."""
+    return _solve_manual_lagrangian_bnb(
+        R,
+        B,
+        candidate_eids=candidate_eids,
+        max_nodes=max_nodes,
+        max_lagrangian_iters=max_lagrangian_iters,
+        time_limit=time_limit,
+        exact_tail_time_limit=exact_tail_time_limit,
+        step_rule=step_rule,
+        enable_dynamic_scc_pruning=enable_dynamic_scc_pruning,
+    )
