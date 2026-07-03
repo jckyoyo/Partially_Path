@@ -28,6 +28,8 @@ def _solve_edge_subset_ilp(
     allowed_eids: set[int],
     time_limit: Optional[float],
     mip_gap: Optional[float],
+    force_one: Optional[set[int]] = None,
+    force_zero: Optional[set[int]] = None,
 ) -> ILPResult:
     start = time.perf_counter()
     try:
@@ -35,7 +37,15 @@ def _solve_edge_subset_ilp(
         from gurobipy import GRB
     except Exception:
         return ILPResult(0.0, 0, [], False, "NO_GUROBI", time.perf_counter() - start)
+    force_one = set() if force_one is None else set(force_one)
+    force_zero = set() if force_zero is None else set(force_zero)
+    if force_one & force_zero:
+        return ILPResult(0.0, 0, [], False, "INFEASIBLE", time.perf_counter() - start)
+
     by_id = edge_by_id(R)
+    if not force_one <= allowed_eids or not force_zero <= allowed_eids:
+        return ILPResult(0.0, 0, [], False, "INFEASIBLE", time.perf_counter() - start)
+
     edges = [e for eid, e in by_id.items() if eid in allowed_eids]
     model = gp.Model("residual_circulation")
     model.Params.OutputFlag = 0
@@ -46,6 +56,10 @@ def _solve_edge_subset_ilp(
     x = {e.eid: model.addVar(vtype=GRB.BINARY, name=f"x_{e.eid}") for e in edges}
     model.setObjective(gp.quicksum(e.weight * x[e.eid] for e in edges), GRB.MINIMIZE)
     model.addConstr(gp.quicksum(e.cost * x[e.eid] for e in edges) <= B, name="budget")
+    for eid in force_one:
+        model.addConstr(x[eid] == 1, name=f"force_one_{eid}")
+    for eid in force_zero:
+        model.addConstr(x[eid] == 0, name=f"force_zero_{eid}")
     for v in R.nodes:
         out_expr = gp.quicksum(eid_var for eid, eid_var in x.items() if by_id[eid].u == v)
         in_expr = gp.quicksum(eid_var for eid, eid_var in x.items() if by_id[eid].v == v)
@@ -100,3 +114,23 @@ def solve_candidate_edge_subgraph_ilp(
     for cycle in cycles:
         allowed.update(cycle.edge_ids)
     return _solve_edge_subset_ilp(R, B, allowed, time_limit, mip_gap)
+
+
+def solve_residual_circulation_ilp_with_fixed(
+    R: nx.MultiDiGraph,
+    B: int,
+    force_one: set[int],
+    force_zero: set[int],
+    time_limit: Optional[float] = None,
+    mip_gap: Optional[float] = None,
+) -> ILPResult:
+    """Solve the full residual circulation ILP with fixed edge variables."""
+    return _solve_edge_subset_ilp(
+        R,
+        B,
+        set(edge_by_id(R)),
+        time_limit,
+        mip_gap,
+        force_one=set(force_one),
+        force_zero=set(force_zero),
+    )

@@ -28,8 +28,10 @@ from ldp_experiment.candidate_cycles import (  # noqa: E402
     enumerate_candidate_cycles,
     validate_candidate_cycles,
 )
+from ldp_experiment.candidate_edges import extract_candidate_key_edges  # noqa: E402
 from ldp_experiment.conflict_dp import DPResult, solve_by_conflict_dp  # noqa: E402
 from ldp_experiment.graph_utils import EPS, add_edge_with_attrs  # noqa: E402
+from ldp_experiment.lagrangian_bnb import BNBResult, solve_candidate_edge_lagrangian_bnb  # noqa: E402
 from ldp_experiment.ldp_algorithm import run_ldp  # noqa: E402
 from ldp_experiment.residual_ilp import (  # noqa: E402
     ILPResult,
@@ -164,6 +166,11 @@ def run_single_experiment(
     mip_gap: Optional[float] = None,
     run_ilp: bool = True,
     validate_cycles: bool = True,
+    run_bnb: bool = False,
+    bnb_max_nodes: Optional[int] = None,
+    bnb_lagrangian_iters: int = 30,
+    bnb_time_limit: Optional[float] = None,
+    bnb_tail_time_limit: Optional[float] = None,
 ) -> dict[str, Any]:
     """Run one full experiment on a supplied NetworkX MultiDiGraph.
 
@@ -294,6 +301,44 @@ def run_single_experiment(
             "cand_ilp_matches_full_ilp": _match_if_certified(cand.objective, full.objective, cand.status, full.status),
         }
     )
+
+    # 5. Optional candidate-edge-guided Lagrangian B&B.
+    if run_bnb:
+        try:
+            candidate_eids = extract_candidate_key_edges(ldp.residual)
+            bnb = solve_candidate_edge_lagrangian_bnb(
+                ldp.residual,
+                B,
+                candidate_eids=candidate_eids,
+                max_nodes=bnb_max_nodes,
+                max_lagrangian_iters=bnb_lagrangian_iters,
+                time_limit=bnb_time_limit,
+                exact_tail_time_limit=bnb_tail_time_limit,
+            )
+        except Exception as exc:
+            bnb = BNBResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0, 0, 0, 0, 0, 0, 0, 0.0)
+    else:
+        bnb = BNBResult(0.0, 0, [], False, "SKIPPED", 0.0, 0, 0, 0, 0, 0, 0, 0.0)
+
+    row.update(
+        {
+            "candidate_edge_bnb_objective": bnb.objective,
+            "candidate_edge_bnb_cost": bnb.total_cost,
+            "candidate_edge_bnb_improved": bnb.improved,
+            "candidate_edge_bnb_time": bnb.runtime_sec,
+            "candidate_edge_bnb_status": bnb.status,
+            "num_candidate_edges": bnb.num_candidate_edges,
+            "bnb_nodes": bnb.num_nodes,
+            "bnb_pruned_by_bound": bnb.num_pruned_by_bound,
+            "bnb_pruned_by_scc": bnb.num_pruned_by_scc,
+            "bnb_infeasible_lr": bnb.num_infeasible_lr,
+            "bnb_exact_tail_calls": bnb.num_exact_tail_calls,
+            "bnb_best_lb": bnb.best_lb,
+            "bnb_matches_full_ilp": _match_dp_vs_ilp(bnb.objective, full.objective, full.status)
+            if _is_optimal(bnb.status)
+            else "",
+        }
+    )
     return row
 
 
@@ -340,9 +385,22 @@ CSV_FIELDS = [
     "cand_ilp_time",
     "cand_ilp_status",
     "cand_ilp_selected_edges",
+    "candidate_edge_bnb_objective",
+    "candidate_edge_bnb_cost",
+    "candidate_edge_bnb_improved",
+    "candidate_edge_bnb_time",
+    "candidate_edge_bnb_status",
+    "num_candidate_edges",
+    "bnb_nodes",
+    "bnb_pruned_by_bound",
+    "bnb_pruned_by_scc",
+    "bnb_infeasible_lr",
+    "bnb_exact_tail_calls",
+    "bnb_best_lb",
     "dp_matches_full_ilp",
     "dp_matches_cand_ilp",
     "cand_ilp_matches_full_ilp",
+    "bnb_matches_full_ilp",
     "cycle_enum_error",
     "dp_error",
 ]
@@ -368,6 +426,11 @@ def main() -> None:
     parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
     parser.add_argument("--max-exact-component-size", type=int, default=25)
     parser.add_argument("--no-validate-cycles", action="store_true")
+    parser.add_argument("--run-bnb", action="store_true")
+    parser.add_argument("--bnb-max-nodes", type=int, default=None)
+    parser.add_argument("--bnb-lagrangian-iters", type=int, default=30)
+    parser.add_argument("--bnb-time-limit", type=float, default=None)
+    parser.add_argument("--bnb-tail-time-limit", type=float, default=None)
     parser.add_argument("--print-progress", action="store_true")
     args = parser.parse_args()
 
@@ -401,6 +464,11 @@ def main() -> None:
             mip_gap=args.mip_gap,
             run_ilp=not args.skip_ilp,
             validate_cycles=not args.no_validate_cycles,
+            run_bnb=args.run_bnb,
+            bnb_max_nodes=args.bnb_max_nodes,
+            bnb_lagrangian_iters=args.bnb_lagrangian_iters,
+            bnb_time_limit=args.bnb_time_limit,
+            bnb_tail_time_limit=args.bnb_tail_time_limit,
         )
         row.update(
             {
