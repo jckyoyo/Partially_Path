@@ -10,11 +10,13 @@ import time
 import networkx as nx
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from ldp_experiment.candidate_cycles import enumerate_candidate_cycles, validate_candidate_cycles
+from ldp_experiment.candidate_edges import extract_candidate_key_edges
 from ldp_experiment.conflict_dp import solve_by_conflict_dp
 from ldp_experiment.graph_utils import add_edge_with_attrs, edge_by_id
+from ldp_experiment.lagrangian_bnb import solve_candidate_edge_lagrangian_bnb
 from ldp_experiment.ldp_algorithm import run_ldp
 from ldp_experiment.residual_ilp import solve_candidate_edge_subgraph_ilp, solve_residual_circulation_ilp
 
@@ -73,6 +75,12 @@ def main() -> None:
     parser.add_argument("--delta", type=int, default=2)
     parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
     parser.add_argument("--gurobi-time-limit", type=float, default=5.0)
+    parser.add_argument("--run-bnb", action="store_true")
+    parser.add_argument("--bnb-max-nodes", type=int, default=None)
+    parser.add_argument("--bnb-lagrangian-iters", type=int, default=30)
+    parser.add_argument("--bnb-time-limit", type=float, default=None)
+    parser.add_argument("--bnb-tail-time-limit", type=float, default=None)
+    parser.add_argument("--bnb-dynamic-scc-pruning", action="store_true")
     args = parser.parse_args()
 
     total_start = time.perf_counter()
@@ -121,6 +129,23 @@ def main() -> None:
     cand_start = time.perf_counter()
     cand = solve_candidate_edge_subgraph_ilp(ldp.residual, cycles, ldp.remaining_budget, time_limit=args.gurobi_time_limit)
     cand_wall_time = time.perf_counter() - cand_start
+    candidate_eids = extract_candidate_key_edges(ldp.residual)
+    if args.run_bnb:
+        bnb_start = time.perf_counter()
+        bnb = solve_candidate_edge_lagrangian_bnb(
+            ldp.residual,
+            ldp.remaining_budget,
+            candidate_eids=candidate_eids,
+            max_nodes=args.bnb_max_nodes,
+            max_lagrangian_iters=args.bnb_lagrangian_iters,
+            time_limit=args.bnb_time_limit,
+            exact_tail_time_limit=args.bnb_tail_time_limit,
+            enable_dynamic_scc_pruning=args.bnb_dynamic_scc_pruning,
+        )
+        bnb_wall_time = time.perf_counter() - bnb_start
+    else:
+        bnb = None
+        bnb_wall_time = 0.0
 
     print("-----------------测试总运行时间--------------------")
     print(f"total runtime={time.perf_counter() - total_start:.6f}s")
@@ -133,12 +158,23 @@ def main() -> None:
     print("-----------------ILP algorithm--------------------")
     print(f"full ILP runtime={full.runtime_sec:.6f}s, wall={full_wall_time:.6f}s")
     print(f"cand ILP runtime={cand.runtime_sec:.6f}s, wall={cand_wall_time:.6f}s")
+    print(f"candidate key edges={len(candidate_eids)}")
+    if bnb is not None:
+        print(f"B&B runtime={bnb.runtime_sec:.6f}s, wall={bnb_wall_time:.6f}s")
     print(f"LDP + full ILP runtime={ldp_time + full_wall_time:.6f}s")
     print(f"LDP + cand ILP runtime={ldp_time + cand_wall_time:.6f}s")
+    if bnb is not None:
+        print(f"LDP + B&B runtime={ldp_time + bnb_wall_time:.6f}s")
 
     print("-----------------输出值对比--------------------")
     print(f"DP objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, selected={len(dp.selected_cycles)}")
     print(f"full ILP objective={full.objective}, cost={full.total_cost}, improved={full.improved}, status={full.status}")
     print(f"cand ILP objective={cand.objective}, cost={cand.total_cost}, improved={cand.improved}, status={cand.status}")
+    if bnb is not None:
+        print(
+            f"B&B objective={bnb.objective}, cost={bnb.total_cost}, improved={bnb.improved}, "
+            f"status={bnb.status}, nodes={bnb.num_nodes}, pruned_bound={bnb.num_pruned_by_bound}, "
+            f"pruned_scc={bnb.num_pruned_by_scc}, tail_calls={bnb.num_exact_tail_calls}, best_lb={bnb.best_lb}"
+        )
 if __name__ == "__main__":
     main()
