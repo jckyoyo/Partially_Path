@@ -31,7 +31,11 @@ from ldp_experiment.candidate_cycles import (  # noqa: E402
 from ldp_experiment.candidate_edges import extract_candidate_key_edges  # noqa: E402
 from ldp_experiment.conflict_dp import DPResult, solve_by_conflict_dp  # noqa: E402
 from ldp_experiment.graph_utils import EPS, add_edge_with_attrs  # noqa: E402
-from ldp_experiment.lagrangian_bnb import BNBResult, solve_candidate_edge_lagrangian_bnb  # noqa: E402
+from ldp_experiment.lagrangian_bnb import (  # noqa: E402
+    BNBResult,
+    solve_candidate_edge_lagrangian_bnb,
+    solve_candidate_edge_manual_lagrangian_bnb,
+)
 from ldp_experiment.ldp_algorithm import run_ldp  # noqa: E402
 from ldp_experiment.residual_ilp import (  # noqa: E402
     ILPResult,
@@ -79,13 +83,18 @@ def generate_random_digraph(
     weight_low: int = 1,
     weight_high: int = 100,
     seed: Optional[int] = None,
+    source: int = 0,
+    target: Optional[int] = None,
+    plant_ldp_paths: bool = False,
+    planted_path_count: int = 1,
 ) -> nx.MultiDiGraph:
-    """Generate a random directed MultiDiGraph with positive integer weights.
+    """Generate a NetworkX random simple directed graph as a MultiDiGraph.
 
     Notes
     -----
-    * Parallel edges are allowed, which is consistent with MultiDiGraph and
-      avoids impossible requests when ``m > n * (n - 1)``.
+    * NetworkX generates a simple directed graph first, so parallel edges are
+      not present. The graph is then converted to ``MultiDiGraph`` because the
+      residual algorithms use edge IDs on that type.
     * Edge IDs are assigned incrementally during generation. This avoids the
       expensive pattern of scanning all existing edges to find the next eid.
     * All generated edges start as original forward edges with cost 0.
@@ -94,19 +103,48 @@ def generate_random_digraph(
         raise ValueError("n must be at least 2")
     if m < 0:
         raise ValueError("m must be non-negative")
+    max_edges = n * (n - 1)
+    if m > max_edges:
+        raise ValueError(f"m={m} exceeds maximum simple directed edges {max_edges}")
     if weight_low <= 0 or weight_high < weight_low:
         raise ValueError("weights must be positive and weight_high >= weight_low")
 
-    rng = random.Random(seed)
-    G = nx.MultiDiGraph()
-    G.add_nodes_from(range(n))
+    target = n - 1 if target is None else target
+    if source == target:
+        raise ValueError("source and target must differ")
+    if plant_ldp_paths and planted_path_count < 1:
+        raise ValueError("planted_path_count must be positive")
 
-    for eid in range(m):
-        while True:
-            u = rng.randrange(n)
-            v = rng.randrange(n)
-            if u != v:
-                break
+    rng = random.Random(seed)
+    planted_edges: set[tuple[int, int]] = set()
+    if plant_ldp_paths:
+        available_internal = [v for v in range(n) if v not in {source, target}]
+        needed_internal = max(planted_path_count - 1, 0)
+        if needed_internal > len(available_internal):
+            raise ValueError("not enough internal nodes to plant disjoint simple paths")
+        rng.shuffle(available_internal)
+        for i in range(planted_path_count):
+            if i == 0:
+                path = [source, target]
+            else:
+                path = [source, available_internal[i - 1], target]
+            planted_edges.update(zip(path, path[1:]))
+        if len(planted_edges) > m:
+            raise ValueError(f"m={m} is too small for {len(planted_edges)} planted path edges")
+
+    simple = nx.DiGraph()
+    simple.add_nodes_from(range(n))
+    simple.add_edges_from(planted_edges)
+    remaining = m - simple.number_of_edges()
+    if remaining > 0:
+        candidates = [(u, v) for u in range(n) for v in range(n) if u != v and not simple.has_edge(u, v)]
+        for u, v in rng.sample(candidates, remaining):
+            simple.add_edge(u, v)
+
+    G = nx.MultiDiGraph()
+    G.add_nodes_from(simple.nodes)
+
+    for eid, (u, v) in enumerate(simple.edges()):
         add_edge_with_attrs(
             G,
             u,
@@ -168,13 +206,17 @@ def run_single_experiment(
     mip_gap: Optional[float] = None,
     run_ilp: bool = True,
     validate_cycles: bool = True,
+    run_cycle_dp: bool = True,
     run_priority_ilp: bool = False,
+    run_manual_bnb: bool = False,
     run_bnb: bool = False,
     bnb_max_nodes: Optional[int] = None,
     bnb_lagrangian_iters: int = 5,
     bnb_time_limit: Optional[float] = None,
     bnb_tail_time_limit: Optional[float] = None,
     bnb_solve_mode: str = "gurobi_priority",
+    progress: bool = False,
+    progress_prefix: str = "",
 ) -> dict[str, Any]:
     """Run one full experiment on a supplied NetworkX MultiDiGraph.
 
@@ -182,6 +224,11 @@ def run_single_experiment(
     and error message instead of crashing the whole batch.
     """
     row: dict[str, Any] = _blank_row()
+
+    def log(message: str) -> None:
+        if progress:
+            print(f"{progress_prefix}{message}", flush=True)
+
     row.update(
         {
             "s": s,
@@ -195,9 +242,12 @@ def run_single_experiment(
 
     # 1. LDP / residual graph construction.
     try:
+        log("LDP start")
         ldp = run_ldp(G, s, t, k, delta)
+        log(f"LDP done: feasible={ldp.feasible}, residual_edges={ldp.residual.number_of_edges()}")
     except Exception as exc:
         row.update({"ldp_feasible": False, "ldp_message": _safe_error_message(exc)})
+        log(f"LDP failed: {_safe_error_message(exc)}")
         return row
 
     row.update(
@@ -216,73 +266,96 @@ def run_single_experiment(
         return row
 
     B = ldp.remaining_budget
+    log("candidate key edge extraction start")
     candidate_eids = extract_candidate_key_edges(ldp.residual)
     row.update({"candidate_edges_count": len(candidate_eids)})
+    log(f"candidate key edge extraction done: count={len(candidate_eids)}")
 
     # 2. Candidate-cycle enumeration.
-    try:
-        cycles = enumerate_candidate_cycles(
-            ldp.residual,
-            exact=exact_cycle_enum,
-            max_cycles_per_anchor=max_cycles_per_anchor,
-        )
-        if validate_cycles:
-            validate_candidate_cycles(ldp.residual, cycles)
-    except Exception as exc:
-        row.update({"cycle_enum_error": _safe_error_message(exc)})
-        return row
+    cycles: list[Cycle] = []
+    if run_cycle_dp:
+        try:
+            log("candidate-cycle enumeration start")
+            cycles = enumerate_candidate_cycles(
+                ldp.residual,
+                exact=exact_cycle_enum,
+                max_cycles_per_anchor=max_cycles_per_anchor,
+            )
+            if validate_cycles:
+                log("candidate-cycle validation start")
+                validate_candidate_cycles(ldp.residual, cycles)
+            log(f"candidate-cycle enumeration done: count={len(cycles)}")
+        except Exception as exc:
+            row.update({"cycle_enum_error": _safe_error_message(exc)})
+            log(f"candidate-cycle enumeration failed: {_safe_error_message(exc)}")
+            return row
 
-    num_neg_pos, num_nonneg_neg = _count_cycle_kinds(cycles)
-    row.update(
-        {
-            "num_candidates": len(cycles),
-            "num_neg_weight_pos_cost": num_neg_pos,
-            "num_nonneg_weight_neg_cost": num_nonneg_neg,
-        }
-    )
-
-    # 3. Conflict-DP.
-    try:
-        dp = solve_by_conflict_dp(cycles, B, max_exact_component_size=max_exact_component_size)
-        dp_validation_error = _validate_dp_result(dp)
+        num_neg_pos, num_nonneg_neg = _count_cycle_kinds(cycles)
         row.update(
             {
-                "num_components": dp.num_components,
-                "max_component_size": dp.max_component_size,
-                "num_dp_states": dp.num_dp_states,
-                "dp_objective": dp.objective,
-                "dp_cost": dp.total_cost,
-                "dp_improved": dp.improved,
-                "dp_time": dp.runtime_sec,
-                "dp_selected_count": len(dp.selected_cycles),
-                "dp_validation_error": dp_validation_error,
+                "num_candidates": len(cycles),
+                "num_neg_weight_pos_cost": num_neg_pos,
+                "num_nonneg_weight_neg_cost": num_nonneg_neg,
             }
         )
-    except Exception as exc:
-        row.update({"dp_error": _safe_error_message(exc)})
-        return row
+
+        # 3. Conflict-DP.
+        try:
+            log("conflict-DP start")
+            dp = solve_by_conflict_dp(cycles, B, max_exact_component_size=max_exact_component_size)
+            dp_validation_error = _validate_dp_result(dp)
+            row.update(
+                {
+                    "num_components": dp.num_components,
+                    "max_component_size": dp.max_component_size,
+                    "num_dp_states": dp.num_dp_states,
+                    "dp_objective": dp.objective,
+                    "dp_cost": dp.total_cost,
+                    "dp_improved": dp.improved,
+                    "dp_time": dp.runtime_sec,
+                    "dp_selected_count": len(dp.selected_cycles),
+                    "dp_validation_error": dp_validation_error,
+                }
+            )
+            log(f"conflict-DP done: objective={dp.objective}, status=OK")
+        except Exception as exc:
+            row.update({"dp_error": _safe_error_message(exc)})
+            log(f"conflict-DP failed: {_safe_error_message(exc)}")
+            return row
+    else:
+        log("candidate-cycle DP skipped")
+        dp = DPResult(0.0, 0, [], False, 0, 0, 0, 0, 0.0)
 
     # 4. Optional ILP baselines.
     if run_ilp:
         try:
+            log("full residual ILP start")
             full = solve_residual_circulation_ilp(
                 ldp.residual,
                 B,
                 time_limit=gurobi_time_limit,
                 mip_gap=mip_gap,
             )
+            log(f"full residual ILP done: status={full.status}, objective={full.objective}")
         except Exception as exc:
             full = ILPResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0)
-        try:
-            cand = solve_candidate_edge_subgraph_ilp(
-                ldp.residual,
-                cycles,
-                B,
-                time_limit=gurobi_time_limit,
-                mip_gap=mip_gap,
-            )
-        except Exception as exc:
-            cand = ILPResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0)
+            log(f"full residual ILP failed: {_safe_error_message(exc)}")
+        if run_cycle_dp:
+            try:
+                log("candidate-edge subgraph ILP start")
+                cand = solve_candidate_edge_subgraph_ilp(
+                    ldp.residual,
+                    cycles,
+                    B,
+                    time_limit=gurobi_time_limit,
+                    mip_gap=mip_gap,
+                )
+                log(f"candidate-edge subgraph ILP done: status={cand.status}, objective={cand.objective}")
+            except Exception as exc:
+                cand = ILPResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0)
+                log(f"candidate-edge subgraph ILP failed: {_safe_error_message(exc)}")
+        else:
+            cand = ILPResult(0.0, 0, [], False, "SKIPPED", 0.0)
     else:
         full = ILPResult(0.0, 0, [], False, "SKIPPED", 0.0)
         cand = ILPResult(0.0, 0, [], False, "SKIPPED", 0.0)
@@ -302,8 +375,8 @@ def run_single_experiment(
             "cand_ilp_status": cand.status,
             "cand_ilp_selected_edges": len(cand.selected_edge_ids),
             # Only compare against certified optimal ILP results.
-            "dp_matches_full_ilp": _match_dp_vs_ilp(dp.objective, full.objective, full.status),
-            "dp_matches_cand_ilp": _match_dp_vs_ilp(dp.objective, cand.objective, cand.status),
+            "dp_matches_full_ilp": _match_dp_vs_ilp(dp.objective, full.objective, full.status) if run_cycle_dp else "",
+            "dp_matches_cand_ilp": _match_dp_vs_ilp(dp.objective, cand.objective, cand.status) if run_cycle_dp else "",
             "cand_ilp_matches_full_ilp": _match_if_certified(cand.objective, full.objective, cand.status, full.status),
         }
     )
@@ -311,6 +384,7 @@ def run_single_experiment(
     # 5. Optional full residual ILP with Gurobi BranchPriority on candidate edges.
     if run_priority_ilp:
         try:
+            log("priority ILP start")
             priority = solve_residual_circulation_ilp_with_candidate_priority(
                 ldp.residual,
                 B,
@@ -318,8 +392,10 @@ def run_single_experiment(
                 time_limit=gurobi_time_limit,
                 mip_gap=mip_gap,
             )
+            log(f"priority ILP done: status={priority.status}, objective={priority.objective}")
         except Exception as exc:
             priority = ILPResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0)
+            log(f"priority ILP failed: {_safe_error_message(exc)}")
     else:
         priority = ILPResult(0.0, 0, [], False, "SKIPPED", 0.0)
 
@@ -341,7 +417,44 @@ def run_single_experiment(
         }
     )
 
-    # 6. Optional candidate-edge-guided exact solver wrapper.
+    # 6. Optional hand-written Lagrangian B&B.
+    if run_manual_bnb:
+        try:
+            log("manual Lagrangian B&B start")
+            manual = solve_candidate_edge_manual_lagrangian_bnb(
+                ldp.residual,
+                B,
+                candidate_eids=candidate_eids,
+                max_nodes=bnb_max_nodes,
+                max_lagrangian_iters=bnb_lagrangian_iters,
+                time_limit=bnb_time_limit,
+                exact_tail_time_limit=bnb_tail_time_limit,
+            )
+            log(f"manual Lagrangian B&B done: status={manual.status}, objective={manual.objective}, nodes={manual.num_nodes}")
+        except Exception as exc:
+            manual = BNBResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0, 0, 0, 0, 0, 0, 0, 0.0)
+            log(f"manual Lagrangian B&B failed: {_safe_error_message(exc)}")
+    else:
+        manual = BNBResult(0.0, 0, [], False, "SKIPPED", 0.0, 0, 0, 0, 0, 0, 0, 0.0)
+
+    row.update(
+        {
+            "manual_bnb_objective": manual.objective,
+            "manual_bnb_cost": manual.total_cost,
+            "manual_bnb_improved": manual.improved,
+            "manual_bnb_time": manual.runtime_sec,
+            "manual_bnb_status": manual.status,
+            "manual_bnb_nodes": manual.num_nodes,
+            "manual_bnb_pruned_by_bound": manual.num_pruned_by_bound,
+            "manual_bnb_pruned_by_scc": manual.num_pruned_by_scc,
+            "manual_bnb_infeasible_lr": manual.num_infeasible_lr,
+            "manual_bnb_exact_tail_calls": manual.num_exact_tail_calls,
+            "manual_bnb_best_lb": manual.best_lb,
+            "manual_bnb_matches_full_ilp": _match_if_certified(manual.objective, full.objective, manual.status, full.status),
+        }
+    )
+
+    # 7. Optional legacy wrapper path.
     if run_bnb:
         try:
             bnb = solve_candidate_edge_lagrangian_bnb(
@@ -439,6 +552,18 @@ CSV_FIELDS = [
     "priority_ilp_nodes",
     "priority_ilp_gap",
     "priority_matches_full_ilp",
+    "manual_bnb_objective",
+    "manual_bnb_cost",
+    "manual_bnb_improved",
+    "manual_bnb_time",
+    "manual_bnb_status",
+    "manual_bnb_nodes",
+    "manual_bnb_pruned_by_bound",
+    "manual_bnb_pruned_by_scc",
+    "manual_bnb_infeasible_lr",
+    "manual_bnb_exact_tail_calls",
+    "manual_bnb_best_lb",
+    "manual_bnb_matches_full_ilp",
     "bnb_objective",
     "bnb_cost",
     "bnb_improved",
@@ -479,6 +604,11 @@ def main() -> None:
     parser.add_argument("--target", type=int, default=None)
     parser.add_argument("--weight-low", type=int, default=1)
     parser.add_argument("--weight-high", type=int, default=100)
+    parser.add_argument(
+        "--plant-ldp-paths",
+        action="store_true",
+        help="Plant simple s-t paths before adding random edges so LDP is more likely feasible.",
+    )
     parser.add_argument("--gurobi-time-limit", type=float, default=None)
     parser.add_argument("--mip-gap", type=float, default=None)
     parser.add_argument("--skip-ilp", action="store_true", help="Skip both full and candidate-edge ILP baselines.")
@@ -486,7 +616,14 @@ def main() -> None:
     parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
     parser.add_argument("--max-exact-component-size", type=int, default=25)
     parser.add_argument("--no-validate-cycles", action="store_true")
+    parser.add_argument(
+        "--exact-comparison",
+        action="store_true",
+        help="Compare full ILP, priority ILP, and manual Lagrangian B&B; skips candidate-cycle DP.",
+    )
+    parser.add_argument("--skip-cycle-dp", action="store_true", help="Skip candidate-cycle enumeration and conflict DP.")
     parser.add_argument("--run-priority-ilp", action="store_true")
+    parser.add_argument("--run-manual-bnb", action="store_true")
     parser.add_argument("--run-bnb", action="store_true")
     parser.add_argument(
         "--bnb-solve-mode",
@@ -503,20 +640,32 @@ def main() -> None:
     if args.heuristic_cycle_enum and args.max_cycles_per_anchor is None:
         parser.error("--heuristic-cycle-enum requires --max-cycles-per-anchor; otherwise enumeration is not truncated")
 
+    run_cycle_dp = not (args.skip_cycle_dp or args.exact_comparison)
+    run_priority_ilp = args.run_priority_ilp or args.exact_comparison
+    run_manual_bnb = args.run_manual_bnb or args.exact_comparison
+    run_ilp = not args.skip_ilp or args.exact_comparison
+
     target = args.n - 1 if args.target is None else args.target
     rows: list[dict[str, Any]] = []
 
     for trial in range(args.trials):
         trial_seed = args.seed + trial
+        progress_prefix = f"[trial {trial + 1}/{args.trials} seed={trial_seed}] "
         if args.print_progress:
-            print(f"trial {trial + 1}/{args.trials}, seed={trial_seed}", flush=True)
+            print(f"{progress_prefix}generate graph start", flush=True)
         G = generate_random_digraph(
             args.n,
             args.m,
             weight_low=args.weight_low,
             weight_high=args.weight_high,
             seed=trial_seed,
+            source=args.source,
+            target=target,
+            plant_ldp_paths=args.plant_ldp_paths,
+            planted_path_count=args.k,
         )
+        if args.print_progress:
+            print(f"{progress_prefix}generate graph done: nodes={G.number_of_nodes()}, edges={G.number_of_edges()}", flush=True)
         row = run_single_experiment(
             G,
             args.source,
@@ -528,15 +677,19 @@ def main() -> None:
             max_exact_component_size=args.max_exact_component_size,
             gurobi_time_limit=args.gurobi_time_limit,
             mip_gap=args.mip_gap,
-            run_ilp=not args.skip_ilp,
+            run_ilp=run_ilp,
             validate_cycles=not args.no_validate_cycles,
-            run_priority_ilp=args.run_priority_ilp,
+            run_cycle_dp=run_cycle_dp,
+            run_priority_ilp=run_priority_ilp,
+            run_manual_bnb=run_manual_bnb,
             run_bnb=args.run_bnb,
             bnb_solve_mode=args.bnb_solve_mode,
             bnb_max_nodes=args.bnb_max_nodes,
             bnb_lagrangian_iters=args.bnb_lagrangian_iters,
             bnb_time_limit=args.bnb_time_limit,
             bnb_tail_time_limit=args.bnb_tail_time_limit,
+            progress=args.print_progress,
+            progress_prefix=progress_prefix,
         )
         row.update(
             {
@@ -549,6 +702,14 @@ def main() -> None:
             }
         )
         rows.append(row)
+        if args.print_progress:
+            print(
+                f"{progress_prefix}trial done: "
+                f"full={row.get('full_ilp_status')} obj={row.get('full_ilp_objective')}, "
+                f"priority={row.get('priority_ilp_status')} obj={row.get('priority_ilp_objective')}, "
+                f"manual={row.get('manual_bnb_status')} obj={row.get('manual_bnb_objective')}",
+                flush=True,
+            )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", newline="", encoding="utf-8") as f:
