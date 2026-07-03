@@ -25,8 +25,8 @@ correctness even though branching was guided by only a subset of edges.
 Static SCC pruning belongs to candidate-edge extraction: it removes key-edge
 hints that cannot lie on any directed cycle in the residual graph. The optional
 node-level SCC check below is a stronger dynamic pruning rule after branch
-exclusions, but it is disabled by default because it can be expensive and is not
-part of candidate-edge discovery.
+exclusions. It is used only by ``manual_lagrangian_bnb`` mode; the default
+``gurobi_priority`` mode delegates branch-and-bound to Gurobi.
 
 This implementation intentionally does not include cost-feasibility pruning.
 """
@@ -42,7 +42,10 @@ import networkx as nx
 
 from ldp_experiment.candidate_edges import extract_candidate_key_edges
 from ldp_experiment.graph_utils import EPS, edge_by_id
-from ldp_experiment.residual_ilp import solve_residual_circulation_ilp_with_fixed
+from ldp_experiment.residual_ilp import (
+    solve_residual_circulation_ilp_with_candidate_priority,
+    solve_residual_circulation_ilp_with_fixed,
+)
 
 
 @dataclass
@@ -185,30 +188,31 @@ def _choose_branch_eid(
     unfixed = candidate_eids - set(force_one) - set(force_zero)
     selected_candidates = [eid for eid in last_lr_selected if eid in unfixed]
     if selected_candidates:
-        return min(selected_candidates)
-    return min(
-        unfixed,
-        key=lambda eid: (
-            0 if by_id[eid].weight < -EPS else 1,
-            0 if by_id[eid].cost < 0 else 1,
-            -abs(by_id[eid].weight),
-            eid,
-        ),
+        return min(selected_candidates, key=lambda eid: _branch_sort_key(by_id, eid))
+    return min(unfixed, key=lambda eid: _branch_sort_key(by_id, eid))
+
+
+def _branch_sort_key(by_id: dict[int, object], eid: int) -> tuple[int, int, float, int]:
+    return (
+        0 if by_id[eid].weight < -EPS else 1,
+        0 if by_id[eid].cost < 0 else 1,
+        -abs(by_id[eid].weight),
+        eid,
     )
 
 
-def solve_candidate_edge_lagrangian_bnb(
+def _solve_manual_lagrangian_bnb(
     R: nx.MultiDiGraph,
     B: int,
     candidate_eids: Optional[set[int]] = None,
     max_nodes: Optional[int] = None,
-    max_lagrangian_iters: int = 30,
+    max_lagrangian_iters: int = 5,
     time_limit: Optional[float] = None,
     exact_tail_time_limit: Optional[float] = None,
     step_rule: str = "polyak",
-    enable_dynamic_scc_pruning: bool = False,
+    enable_dynamic_scc_pruning: bool = True,
 ) -> BNBResult:
-    """Solve the full residual circulation problem by candidate-guided B&B."""
+    """Solve by the original hand-written Lagrangian B&B."""
     start = time.perf_counter()
     by_id = edge_by_id(R)
     candidate_set = extract_candidate_key_edges(R) if candidate_eids is None else set(candidate_eids)
@@ -362,3 +366,68 @@ def solve_candidate_edge_lagrangian_bnb(
         stack.append(include)
 
     return finish(status)
+
+
+def solve_candidate_edge_lagrangian_bnb(
+    R: nx.MultiDiGraph,
+    B: int,
+    candidate_eids: Optional[set[int]] = None,
+    max_nodes: Optional[int] = None,
+    max_lagrangian_iters: int = 5,
+    time_limit: Optional[float] = None,
+    exact_tail_time_limit: Optional[float] = None,
+    step_rule: str = "polyak",
+    enable_dynamic_scc_pruning: bool = True,
+    solve_mode: str = "gurobi_priority",
+    mip_gap: Optional[float] = None,
+) -> BNBResult:
+    """Solve the full residual circulation problem by the selected B&B mode.
+
+    ``gurobi_priority`` is the recommended default: it solves the complete
+    residual ILP once and uses candidate edges only as Gurobi BranchPriority
+    guidance. ``manual_lagrangian_bnb`` keeps the original Python-level
+    Lagrangian branch-and-bound for theory and comparison experiments.
+    """
+    candidate_set = extract_candidate_key_edges(R) if candidate_eids is None else set(candidate_eids)
+    candidate_set &= set(edge_by_id(R))
+
+    if solve_mode == "gurobi_priority":
+        result = solve_residual_circulation_ilp_with_candidate_priority(
+            R,
+            B,
+            candidate_eids=candidate_set,
+            time_limit=time_limit,
+            mip_gap=mip_gap,
+        )
+        node_count = -1 if result.node_count is None else int(round(result.node_count))
+        best_lb = result.objective if result.status == "OPTIMAL" else 0.0
+        return BNBResult(
+            objective=result.objective,
+            total_cost=result.total_cost,
+            selected_edge_ids=result.selected_edge_ids,
+            improved=result.improved,
+            status=f"PRIORITY_ILP_{result.status}",
+            runtime_sec=result.runtime_sec,
+            num_nodes=node_count,
+            num_pruned_by_bound=0,
+            num_pruned_by_scc=0,
+            num_infeasible_lr=0,
+            num_exact_tail_calls=0,
+            num_candidate_edges=len(candidate_set),
+            best_lb=best_lb,
+        )
+
+    if solve_mode == "manual_lagrangian_bnb":
+        return _solve_manual_lagrangian_bnb(
+            R,
+            B,
+            candidate_eids=candidate_set,
+            max_nodes=max_nodes,
+            max_lagrangian_iters=max_lagrangian_iters,
+            time_limit=time_limit,
+            exact_tail_time_limit=exact_tail_time_limit,
+            step_rule=step_rule,
+            enable_dynamic_scc_pruning=enable_dynamic_scc_pruning,
+        )
+
+    raise ValueError(f"unknown solve_mode {solve_mode!r}")

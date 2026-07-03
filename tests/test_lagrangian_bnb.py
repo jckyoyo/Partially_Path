@@ -9,7 +9,10 @@ pytest.importorskip("gurobipy")
 
 from ldp_experiment.graph_utils import EPS, add_edge_with_attrs
 from ldp_experiment.lagrangian_bnb import solve_candidate_edge_lagrangian_bnb
-from ldp_experiment.residual_ilp import solve_residual_circulation_ilp
+from ldp_experiment.residual_ilp import (
+    solve_residual_circulation_ilp,
+    solve_residual_circulation_ilp_with_candidate_priority,
+)
 
 
 def _empty_only_graph() -> nx.MultiDiGraph:
@@ -37,14 +40,14 @@ def _over_budget_plus_release_graph() -> nx.MultiDiGraph:
 
 def test_empty_solution_when_no_negative_feasible_circulation() -> None:
     result = solve_candidate_edge_lagrangian_bnb(_empty_only_graph(), B=3)
-    assert result.status == "OPTIMAL"
+    assert result.status == "PRIORITY_ILP_OPTIMAL"
     assert abs(result.objective) <= EPS
     assert not result.improved
 
 
 def test_finds_one_budget_feasible_negative_cycle() -> None:
     result = solve_candidate_edge_lagrangian_bnb(_one_negative_feasible_cycle(), B=3)
-    assert result.status == "OPTIMAL"
+    assert result.status == "PRIORITY_ILP_OPTIMAL"
     assert result.objective < -EPS
     assert result.improved
     assert result.total_cost <= 3
@@ -52,10 +55,62 @@ def test_finds_one_budget_feasible_negative_cycle() -> None:
 
 def test_over_budget_negative_cycle_can_be_repaired_by_negative_cost_cycle() -> None:
     result = solve_candidate_edge_lagrangian_bnb(_over_budget_plus_release_graph(), B=3)
-    assert result.status == "OPTIMAL"
+    assert result.status == "PRIORITY_ILP_OPTIMAL"
     assert result.objective <= -9 + EPS
     assert result.total_cost <= 3
     assert result.improved
+
+
+def test_priority_ilp_matches_full_ilp_with_empty_candidates() -> None:
+    R = _over_budget_plus_release_graph()
+    full = solve_residual_circulation_ilp(R, B=3)
+    priority = solve_residual_circulation_ilp_with_candidate_priority(R, B=3, candidate_eids=set())
+    assert full.status == "OPTIMAL"
+    assert priority.status == "OPTIMAL"
+    assert abs(priority.objective - full.objective) <= EPS
+
+
+def test_priority_ilp_keeps_full_graph_with_partial_candidates() -> None:
+    R = _one_negative_feasible_cycle()
+    full = solve_residual_circulation_ilp(R, B=3)
+    priority = solve_residual_circulation_ilp_with_candidate_priority(R, B=3, candidate_eids={0})
+    assert full.status == "OPTIMAL"
+    assert priority.status == "OPTIMAL"
+    assert abs(priority.objective - full.objective) <= EPS
+
+
+def test_priority_ilp_respects_fixed_variables() -> None:
+    R = _one_negative_feasible_cycle()
+    forced_one = solve_residual_circulation_ilp_with_candidate_priority(
+        R,
+        B=3,
+        candidate_eids={0},
+        force_one={0},
+        force_zero=set(),
+    )
+    assert forced_one.status == "OPTIMAL"
+    assert 0 in forced_one.selected_edge_ids
+    assert forced_one.total_cost <= 3
+
+    forced_zero = solve_residual_circulation_ilp_with_candidate_priority(
+        R,
+        B=3,
+        candidate_eids={0},
+        force_one=set(),
+        force_zero={0},
+    )
+    assert forced_zero.status == "OPTIMAL"
+    assert 0 not in forced_zero.selected_edge_ids
+    assert abs(forced_zero.objective) <= EPS
+
+
+def test_default_bnb_matches_priority_ilp() -> None:
+    R = _over_budget_plus_release_graph()
+    priority = solve_residual_circulation_ilp_with_candidate_priority(R, B=3, candidate_eids={0, 2})
+    bnb = solve_candidate_edge_lagrangian_bnb(R, B=3, candidate_eids={0, 2})
+    assert priority.status == "OPTIMAL"
+    assert bnb.status == "PRIORITY_ILP_OPTIMAL"
+    assert abs(bnb.objective - priority.objective) <= EPS
 
 
 def test_matches_full_ilp_on_small_random_residual_graphs() -> None:
@@ -82,6 +137,7 @@ def test_matches_full_ilp_on_small_random_residual_graphs() -> None:
             B=3,
             candidate_eids=set(range(7)),
             max_lagrangian_iters=5,
+            solve_mode="manual_lagrangian_bnb",
         )
         assert full.status == "OPTIMAL"
         assert bnb.status == "OPTIMAL", f"trial={trial}, status={bnb.status}"
@@ -91,7 +147,12 @@ def test_matches_full_ilp_on_small_random_residual_graphs() -> None:
 def test_exact_tail_with_tiny_candidate_set_still_matches_full_ilp() -> None:
     R = _one_negative_feasible_cycle()
     full = solve_residual_circulation_ilp(R, B=3)
-    bnb = solve_candidate_edge_lagrangian_bnb(R, B=3, candidate_eids=set())
+    bnb = solve_candidate_edge_lagrangian_bnb(
+        R,
+        B=3,
+        candidate_eids=set(),
+        solve_mode="manual_lagrangian_bnb",
+    )
     assert full.status == "OPTIMAL"
     assert bnb.status == "OPTIMAL"
     assert bnb.num_exact_tail_calls == 1

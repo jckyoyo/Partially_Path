@@ -37,6 +37,7 @@ from ldp_experiment.residual_ilp import (  # noqa: E402
     ILPResult,
     solve_candidate_edge_subgraph_ilp,
     solve_residual_circulation_ilp,
+    solve_residual_circulation_ilp_with_candidate_priority,
 )
 
 
@@ -46,7 +47,8 @@ NO_GUROBI_STATUS = "NO_GUROBI"
 
 def _is_optimal(status: str) -> bool:
     """Return True only when the ILP result is certified optimal."""
-    return str(status).upper() == OPTIMAL_STATUS
+    upper = str(status).upper()
+    return upper == OPTIMAL_STATUS or upper.endswith("_OPTIMAL")
 
 
 def _match_if_certified(a: float, b: float, status_a: str, status_b: str) -> str:
@@ -166,11 +168,13 @@ def run_single_experiment(
     mip_gap: Optional[float] = None,
     run_ilp: bool = True,
     validate_cycles: bool = True,
+    run_priority_ilp: bool = False,
     run_bnb: bool = False,
     bnb_max_nodes: Optional[int] = None,
-    bnb_lagrangian_iters: int = 30,
+    bnb_lagrangian_iters: int = 5,
     bnb_time_limit: Optional[float] = None,
     bnb_tail_time_limit: Optional[float] = None,
+    bnb_solve_mode: str = "gurobi_priority",
 ) -> dict[str, Any]:
     """Run one full experiment on a supplied NetworkX MultiDiGraph.
 
@@ -212,6 +216,8 @@ def run_single_experiment(
         return row
 
     B = ldp.remaining_budget
+    candidate_eids = extract_candidate_key_edges(ldp.residual)
+    row.update({"candidate_edges_count": len(candidate_eids)})
 
     # 2. Candidate-cycle enumeration.
     try:
@@ -302,10 +308,42 @@ def run_single_experiment(
         }
     )
 
-    # 5. Optional candidate-edge-guided Lagrangian B&B.
+    # 5. Optional full residual ILP with Gurobi BranchPriority on candidate edges.
+    if run_priority_ilp:
+        try:
+            priority = solve_residual_circulation_ilp_with_candidate_priority(
+                ldp.residual,
+                B,
+                candidate_eids=candidate_eids,
+                time_limit=gurobi_time_limit,
+                mip_gap=mip_gap,
+            )
+        except Exception as exc:
+            priority = ILPResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0)
+    else:
+        priority = ILPResult(0.0, 0, [], False, "SKIPPED", 0.0)
+
+    row.update(
+        {
+            "priority_ilp_objective": priority.objective,
+            "priority_ilp_cost": priority.total_cost,
+            "priority_ilp_improved": priority.improved,
+            "priority_ilp_time": priority.runtime_sec,
+            "priority_ilp_status": priority.status,
+            "priority_ilp_nodes": priority.node_count if priority.node_count is not None else "",
+            "priority_ilp_gap": priority.mip_gap if priority.mip_gap is not None else "",
+            "priority_matches_full_ilp": _match_if_certified(
+                priority.objective,
+                full.objective,
+                priority.status,
+                full.status,
+            ),
+        }
+    )
+
+    # 6. Optional candidate-edge-guided exact solver wrapper.
     if run_bnb:
         try:
-            candidate_eids = extract_candidate_key_edges(ldp.residual)
             bnb = solve_candidate_edge_lagrangian_bnb(
                 ldp.residual,
                 B,
@@ -314,6 +352,8 @@ def run_single_experiment(
                 max_lagrangian_iters=bnb_lagrangian_iters,
                 time_limit=bnb_time_limit,
                 exact_tail_time_limit=bnb_tail_time_limit,
+                solve_mode=bnb_solve_mode,
+                mip_gap=mip_gap,
             )
         except Exception as exc:
             bnb = BNBResult(0.0, 0, [], False, f"ERROR:{_safe_error_message(exc)}", 0.0, 0, 0, 0, 0, 0, 0, 0.0)
@@ -322,21 +362,26 @@ def run_single_experiment(
 
     row.update(
         {
+            "bnb_objective": bnb.objective,
+            "bnb_cost": bnb.total_cost,
+            "bnb_improved": bnb.improved,
+            "bnb_time": bnb.runtime_sec,
+            "bnb_status": bnb.status,
+            "bnb_nodes": bnb.num_nodes,
+            "bnb_pruned_by_bound": bnb.num_pruned_by_bound,
+            "bnb_pruned_by_scc": bnb.num_pruned_by_scc,
+            "bnb_exact_tail_calls": bnb.num_exact_tail_calls,
+            "bnb_best_lb": bnb.best_lb,
+            "bnb_solve_mode": bnb_solve_mode if run_bnb else "",
+            "bnb_matches_full_ilp": _match_if_certified(bnb.objective, full.objective, bnb.status, full.status),
+            # Backward-compatible names from the first B&B experiment version.
             "candidate_edge_bnb_objective": bnb.objective,
             "candidate_edge_bnb_cost": bnb.total_cost,
             "candidate_edge_bnb_improved": bnb.improved,
             "candidate_edge_bnb_time": bnb.runtime_sec,
             "candidate_edge_bnb_status": bnb.status,
             "num_candidate_edges": bnb.num_candidate_edges,
-            "bnb_nodes": bnb.num_nodes,
-            "bnb_pruned_by_bound": bnb.num_pruned_by_bound,
-            "bnb_pruned_by_scc": bnb.num_pruned_by_scc,
             "bnb_infeasible_lr": bnb.num_infeasible_lr,
-            "bnb_exact_tail_calls": bnb.num_exact_tail_calls,
-            "bnb_best_lb": bnb.best_lb,
-            "bnb_matches_full_ilp": _match_dp_vs_ilp(bnb.objective, full.objective, full.status)
-            if _is_optimal(bnb.status)
-            else "",
         }
     )
     return row
@@ -361,6 +406,7 @@ CSV_FIELDS = [
     "path_count",
     "num_residual_nodes",
     "num_residual_edges",
+    "candidate_edges_count",
     "num_candidates",
     "num_neg_weight_pos_cost",
     "num_nonneg_weight_neg_cost",
@@ -385,6 +431,20 @@ CSV_FIELDS = [
     "cand_ilp_time",
     "cand_ilp_status",
     "cand_ilp_selected_edges",
+    "priority_ilp_objective",
+    "priority_ilp_cost",
+    "priority_ilp_improved",
+    "priority_ilp_time",
+    "priority_ilp_status",
+    "priority_ilp_nodes",
+    "priority_ilp_gap",
+    "priority_matches_full_ilp",
+    "bnb_objective",
+    "bnb_cost",
+    "bnb_improved",
+    "bnb_time",
+    "bnb_status",
+    "bnb_solve_mode",
     "candidate_edge_bnb_objective",
     "candidate_edge_bnb_cost",
     "candidate_edge_bnb_improved",
@@ -426,9 +486,15 @@ def main() -> None:
     parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
     parser.add_argument("--max-exact-component-size", type=int, default=25)
     parser.add_argument("--no-validate-cycles", action="store_true")
+    parser.add_argument("--run-priority-ilp", action="store_true")
     parser.add_argument("--run-bnb", action="store_true")
+    parser.add_argument(
+        "--bnb-solve-mode",
+        choices=["gurobi_priority", "manual_lagrangian_bnb"],
+        default="gurobi_priority",
+    )
     parser.add_argument("--bnb-max-nodes", type=int, default=None)
-    parser.add_argument("--bnb-lagrangian-iters", type=int, default=30)
+    parser.add_argument("--bnb-lagrangian-iters", type=int, default=5)
     parser.add_argument("--bnb-time-limit", type=float, default=None)
     parser.add_argument("--bnb-tail-time-limit", type=float, default=None)
     parser.add_argument("--print-progress", action="store_true")
@@ -464,7 +530,9 @@ def main() -> None:
             mip_gap=args.mip_gap,
             run_ilp=not args.skip_ilp,
             validate_cycles=not args.no_validate_cycles,
+            run_priority_ilp=args.run_priority_ilp,
             run_bnb=args.run_bnb,
+            bnb_solve_mode=args.bnb_solve_mode,
             bnb_max_nodes=args.bnb_max_nodes,
             bnb_lagrangian_iters=args.bnb_lagrangian_iters,
             bnb_time_limit=args.bnb_time_limit,

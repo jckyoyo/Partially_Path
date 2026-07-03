@@ -18,7 +18,11 @@ from ldp_experiment.conflict_dp import solve_by_conflict_dp
 from ldp_experiment.graph_utils import add_edge_with_attrs, edge_by_id
 from ldp_experiment.lagrangian_bnb import solve_candidate_edge_lagrangian_bnb
 from ldp_experiment.ldp_algorithm import run_ldp
-from ldp_experiment.residual_ilp import solve_candidate_edge_subgraph_ilp, solve_residual_circulation_ilp
+from ldp_experiment.residual_ilp import (
+    solve_candidate_edge_subgraph_ilp,
+    solve_residual_circulation_ilp,
+    solve_residual_circulation_ilp_with_candidate_priority,
+)
 
 
 MANUAL_EDGES = [
@@ -75,12 +79,19 @@ def main() -> None:
     parser.add_argument("--delta", type=int, default=2)
     parser.add_argument("--max-cycles-per-anchor", type=int, default=None)
     parser.add_argument("--gurobi-time-limit", type=float, default=5.0)
+    parser.add_argument("--run-priority-ilp", action="store_true")
     parser.add_argument("--run-bnb", action="store_true")
+    parser.add_argument(
+        "--bnb-solve-mode",
+        choices=["gurobi_priority", "manual_lagrangian_bnb"],
+        default="gurobi_priority",
+    )
     parser.add_argument("--bnb-max-nodes", type=int, default=None)
-    parser.add_argument("--bnb-lagrangian-iters", type=int, default=30)
+    parser.add_argument("--bnb-lagrangian-iters", type=int, default=5)
     parser.add_argument("--bnb-time-limit", type=float, default=None)
     parser.add_argument("--bnb-tail-time-limit", type=float, default=None)
-    parser.add_argument("--bnb-dynamic-scc-pruning", action="store_true")
+    parser.add_argument("--bnb-dynamic-scc-pruning", dest="bnb_dynamic_scc_pruning", action="store_true", default=True)
+    parser.add_argument("--no-bnb-dynamic-scc-pruning", dest="bnb_dynamic_scc_pruning", action="store_false")
     args = parser.parse_args()
 
     total_start = time.perf_counter()
@@ -130,6 +141,18 @@ def main() -> None:
     cand = solve_candidate_edge_subgraph_ilp(ldp.residual, cycles, ldp.remaining_budget, time_limit=args.gurobi_time_limit)
     cand_wall_time = time.perf_counter() - cand_start
     candidate_eids = extract_candidate_key_edges(ldp.residual)
+    if args.run_priority_ilp:
+        priority_start = time.perf_counter()
+        priority = solve_residual_circulation_ilp_with_candidate_priority(
+            ldp.residual,
+            ldp.remaining_budget,
+            candidate_eids=candidate_eids,
+            time_limit=args.gurobi_time_limit,
+        )
+        priority_wall_time = time.perf_counter() - priority_start
+    else:
+        priority = None
+        priority_wall_time = 0.0
     if args.run_bnb:
         bnb_start = time.perf_counter()
         bnb = solve_candidate_edge_lagrangian_bnb(
@@ -141,40 +164,65 @@ def main() -> None:
             time_limit=args.bnb_time_limit,
             exact_tail_time_limit=args.bnb_tail_time_limit,
             enable_dynamic_scc_pruning=args.bnb_dynamic_scc_pruning,
+            solve_mode=args.bnb_solve_mode,
         )
         bnb_wall_time = time.perf_counter() - bnb_start
     else:
         bnb = None
         bnb_wall_time = 0.0
 
-    print("-----------------测试总运行时间--------------------")
+
+    print("-" * 20 + "测试总运行时间" + "-" * 20)
     print(f"total runtime={time.perf_counter() - total_start:.6f}s")
 
-    print("-----------------ldp运行时间--------------------")
+    print()
+
+
+    print("-" * 20 + "ldp运行时间" + "-" * 20)
     print(f"LDP runtime={ldp_time:.6f}s")
-    print("-----------------our algorithm--------------------")
+    print()
+
+    print("-" * 20 + "DP algorithm" + "-" * 20)
     print(f"our postprocess total runtime={our_algorithm_time:.6f}s")
     print(f"LDP + our postprocess runtime={ldp_time + our_algorithm_time:.6f}s")
-    print("-----------------ILP algorithm--------------------")
+    print()
+
+    print("-" * 20 + "ILP algorithm" + "-" * 20)
     print(f"full ILP runtime={full.runtime_sec:.6f}s, wall={full_wall_time:.6f}s")
     print(f"cand ILP runtime={cand.runtime_sec:.6f}s, wall={cand_wall_time:.6f}s")
     print(f"candidate key edges={len(candidate_eids)}")
-    if bnb is not None:
-        print(f"B&B runtime={bnb.runtime_sec:.6f}s, wall={bnb_wall_time:.6f}s")
     print(f"LDP + full ILP runtime={ldp_time + full_wall_time:.6f}s")
     print(f"LDP + cand ILP runtime={ldp_time + cand_wall_time:.6f}s")
+    print()
+    print("-" * 20 + "B&B algorithm" + "-" * 20)
+    if priority is not None:
+        print(f"priority ILP runtime={priority.runtime_sec:.6f}s, wall={priority_wall_time:.6f}s")
+    if bnb is not None:
+        print(f"B&B runtime={bnb.runtime_sec:.6f}s, wall={bnb_wall_time:.6f}s, mode={args.bnb_solve_mode}")
+
+    if priority is not None:
+        print(f"LDP + priority ILP runtime={ldp_time + priority_wall_time:.6f}s")
     if bnb is not None:
         print(f"LDP + B&B runtime={ldp_time + bnb_wall_time:.6f}s")
-
-    print("-----------------输出值对比--------------------")
-    print(f"DP objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, selected={len(dp.selected_cycles)}")
-    print(f"full ILP objective={full.objective}, cost={full.total_cost}, improved={full.improved}, status={full.status}")
-    print(f"cand ILP objective={cand.objective}, cost={cand.total_cost}, improved={cand.improved}, status={cand.status}")
+    print()
+    print("-"*20+"输出值对比"+"-"*20)
+    print(
+        f"DP objective={dp.objective}, cost={dp.total_cost}, improved={dp.improved}, selected={len(dp.selected_cycles)}")
+    print(
+        f"full ILP objective={full.objective}, cost={full.total_cost}, improved={full.improved}, status={full.status}")
+    print(
+        f"cand ILP objective={cand.objective}, cost={cand.total_cost}, improved={cand.improved}, status={cand.status}")
+    if priority is not None:
+        print(
+            f"priority ILP objective={priority.objective}, cost={priority.total_cost}, "
+            f"improved={priority.improved}, status={priority.status}, nodes={priority.node_count}, gap={priority.mip_gap}"
+        )
     if bnb is not None:
         print(
             f"B&B objective={bnb.objective}, cost={bnb.total_cost}, improved={bnb.improved}, "
             f"status={bnb.status}, nodes={bnb.num_nodes}, pruned_bound={bnb.num_pruned_by_bound}, "
             f"pruned_scc={bnb.num_pruned_by_scc}, tail_calls={bnb.num_exact_tail_calls}, best_lb={bnb.best_lb}"
         )
+    print("-"*40)
 if __name__ == "__main__":
     main()
