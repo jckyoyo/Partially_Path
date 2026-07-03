@@ -164,8 +164,106 @@ def _solve_lagrangian_relaxation_gurobi(
     return _LRResult(True, status, lagrangian_obj, selected, real_weight, real_cost, fractional)
 
 
-def _forced_edges_can_be_circulation(R: nx.MultiDiGraph, force_one: frozenset[int], force_zero: frozenset[int]) -> bool:
-    by_id = edge_by_id(R)
+class _LagrangianRelaxationModel:
+    """Reusable full-graph Lagrangian circulation LP.
+
+    The model owns all residual edge variables and flow-balance constraints.
+    Each solve updates the objective coefficients and temporarily fixes bounds
+    for the current B&B node. Bounds are restored before returning so one node's
+    fixed variables cannot leak into another node.
+    """
+
+    def __init__(self, R: nx.MultiDiGraph) -> None:
+        self.R = R
+        self.by_id = edge_by_id(R)
+        self.all_eids = set(self.by_id)
+        self.edges = list(self.by_id.values())
+        try:
+            import gurobipy as gp
+            from gurobipy import GRB
+        except Exception:
+            self.available = False
+            self.gp = None
+            self.GRB = None
+            self.model = None
+            self.x = {}
+            return
+
+        self.available = True
+        self.gp = gp
+        self.GRB = GRB
+        self.model = gp.Model("lagrangian_residual_circulation_cached")
+        self.model.Params.OutputFlag = 0
+        self.model.ModelSense = GRB.MINIMIZE
+        self.x = {
+            e.eid: self.model.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"x_{e.eid}")
+            for e in self.edges
+        }
+        self.model.update()
+        for v in R.nodes:
+            out_expr = gp.quicksum(var for eid, var in self.x.items() if self.by_id[eid].u == v)
+            in_expr = gp.quicksum(var for eid, var in self.x.items() if self.by_id[eid].v == v)
+            self.model.addConstr(out_expr - in_expr == 0.0, name=f"flow_{v}")
+
+    def solve(
+        self,
+        B: int,
+        force_one: frozenset[int],
+        force_zero: frozenset[int],
+        lam: float,
+        time_limit: Optional[float] = None,
+    ) -> _LRResult:
+        if not self.available:
+            return _LRResult(False, "NO_GUROBI", 0.0, [], 0.0, 0, False)
+
+        if force_one & force_zero or not force_one <= self.all_eids or not force_zero <= self.all_eids:
+            return _LRResult(False, "INFEASIBLE", 0.0, [], 0.0, 0, False)
+
+        assert self.model is not None
+        assert self.GRB is not None
+        GRB = self.GRB
+        model = self.model
+
+        if time_limit is not None:
+            model.Params.TimeLimit = max(float(time_limit), 0.0)
+
+        for edge in self.edges:
+            self.x[edge.eid].Obj = edge.weight + lam * edge.cost
+
+        fixed_eids = set(force_one) | set(force_zero)
+        old_bounds = {eid: (float(self.x[eid].LB), float(self.x[eid].UB)) for eid in fixed_eids}
+        try:
+            for eid in force_one:
+                self.x[eid].LB = 1.0
+                self.x[eid].UB = 1.0
+            for eid in force_zero:
+                self.x[eid].LB = 0.0
+                self.x[eid].UB = 0.0
+            model.optimize()
+            status = _status_name(model.Status, GRB)
+            if model.SolCount == 0:
+                return _LRResult(False, status, 0.0, [], 0.0, 0, False)
+
+            values = {eid: float(var.X) for eid, var in self.x.items()}
+            selected = sorted(eid for eid, value in values.items() if value > 0.5)
+            fractional = any(EPS < value < 1.0 - EPS for value in values.values())
+            real_weight = float(sum(self.by_id[eid].weight for eid in selected))
+            real_cost = int(round(sum(self.by_id[eid].cost for eid in selected)))
+            lagrangian_obj = float(model.ObjVal - lam * B)
+            return _LRResult(True, status, lagrangian_obj, selected, real_weight, real_cost, fractional)
+        finally:
+            for eid, (lb, ub) in old_bounds.items():
+                self.x[eid].LB = lb
+                self.x[eid].UB = ub
+
+
+def _forced_edges_can_be_circulation(
+    R: nx.MultiDiGraph,
+    force_one: frozenset[int],
+    force_zero: frozenset[int],
+    by_id: Optional[dict[int, object]] = None,
+) -> bool:
+    by_id = edge_by_id(R) if by_id is None else by_id
     G = nx.DiGraph()
     G.add_nodes_from(R.nodes)
     for edge in by_id.values():
@@ -217,6 +315,7 @@ def _solve_manual_lagrangian_bnb(
     by_id = edge_by_id(R)
     candidate_set = extract_candidate_key_edges(R) if candidate_eids is None else set(candidate_eids)
     candidate_set &= set(by_id)
+    lr_model = _LagrangianRelaxationModel(R)
 
     ub = 0.0
     best_solution: list[int] = []
@@ -269,7 +368,7 @@ def _solve_manual_lagrangian_bnb(
 
         if node.force_one & node.force_zero:
             continue
-        if enable_dynamic_scc_pruning and not _forced_edges_can_be_circulation(R, node.force_one, node.force_zero):
+        if enable_dynamic_scc_pruning and not _forced_edges_can_be_circulation(R, node.force_one, node.force_zero, by_id):
             pruned_by_scc += 1
             continue
 
@@ -281,8 +380,7 @@ def _solve_manual_lagrangian_bnb(
         iters = max(max_lagrangian_iters, 1)
 
         for it in range(iters):
-            lr = _solve_lagrangian_relaxation_gurobi(
-                R,
+            lr = lr_model.solve(
                 B,
                 node.force_one,
                 node.force_zero,
